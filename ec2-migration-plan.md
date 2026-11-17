@@ -75,6 +75,40 @@
 - CloudTrail shows every deploy is done by the IAM user **`aws-cdk-gentoo`**: the last ones were 2026-10-29, 2026-10-30 and 2026-11-09, all with CDK `2.220.0`. **§3 has to be run by that person, from the CDK repo.**
 - The stack's own node-level config-drift check (`SovRollupCdkStarterStack-runtime-config-drift` alarm) **will fire** between the deploy and the last swap. The old nodes run a configuration that no longer matches the stack. It clears once the old nodes are gone.
 
+### 0.7 How a new i8g.4xlarge instance gets installed (no Ansible change needed)
+The single-NVMe support already exists in the Ansible branch the new instances boot from. It was added upstream by `rollup-starter-ansible` commit `e47315fb34` (2026-10-05, *"Rework EBS disk detection and add support for EBS log volume"*), and that branch's README documents it for single-NVMe instances. This migration only has to **select** it, through CDK (§3).
+
+Boot chain, from launch template user data:
+1. User data writes `/etc/rollup-node.env` (`ROLLUP_NODE_TYPE=primary|secondary|backup`) and runs `/home/ubuntu/render_config.sh`.
+2. The render script fetches the SSM document `…-runtime-config-values-<type>` and writes `/home/ubuntu/runtime_vars.yaml`. That file includes `disk_profile`, `rollup_node_role`, `rollup_sequencer_kind`, the Aurora URL, and `rollup_node_id` (= instance ID).
+3. User data runs `bootstrap.sh` and `ansible-pull` of `rollup-starter-ansible@cdk-deployment-october-2026` (`local.yml`, roles `common` + `rollup`).
+4. Ansible `common` role:
+   - `custom_vars.yaml` loads the profile.
+   - `disk_discovery.yaml` lists instance-store disks by model (`Amazon EC2 NVMe Instance Storage`). It resolves the EBS volumes by **EC2 attachment name** (`/dev/sdg`, `/dev/sdf`) using `discover_ebs_disk.py`, which reads the NVMe controller metadata, so Linux device order doesn't matter.
+   - `disks.yaml` formats and mounts the disks.
+5. Ansible `rollup` role:
+   - builds the rollup at commit `40c49a68…` and installs `rollup.service`;
+   - installs `restore-from-snapshot.sh`;
+   - on the backup only, installs the hourly snapshot cron;
+   - starts rollup.
+
+What `disks.yaml` does on each layout:
+
+| | Today: c8gd.12xlarge, 3 NVMe | New: i8g.4xlarge, 1 NVMe |
+|---|---|---|
+| Profile (primary/secondary) | `aws_raid_0` | `aws_single_nvme_ebs_logs` |
+| `/mnt/rollup` | `mdadm` RAID0 of NVMe 1 + 2 (`/dev/md/rollup`), ext4 | the single NVMe directly, ext4, **no mdadm** |
+| `/mnt/logs` (+ journald) | NVMe 3 | EBS attached as **`/dev/sdg`** (new in the launch template) |
+| Profile (backup) | `aws_ebs_backup_node_raid_0` | `aws_ebs_backup_node_single_nvme` |
+| `/mnt/snapshots` (backup) | EBS `/dev/sdf` | EBS `/dev/sdf`, unchanged |
+| Snapshot cron (backup) | yes (profile name contains `backup_node`) | yes, same rule |
+
+Nothing else in the branch assumes a RAID device: no `md` device in monitoring, tuning or journald. The only other match is `mdadm` in the package list.
+
+Failure modes, which all stop Ansible before any formatting:
+- profile still `aws_raid_0` on 1 NVMe → *"Not enough instance store disks for RAID"*;
+- `/dev/sdg` missing from the launch template → *"Expected exactly one EBS device attached as /dev/sdg; found 0"*.
+
 ---
 
 ## 1. Variables
@@ -139,7 +173,7 @@ cat /proc/mdstat; lsblk -o NAME,MODEL,SIZE,MOUNTPOINTS
 df -h /mnt/rollup /mnt/logs /mnt/snapshots 2>/dev/null
 sudo du -sh /mnt/logs/* 2>/dev/null | sort -h | tail
 ```
-Set `LOGS_GB` (EBS `/dev/sdg`) to at least 2 × the current `/mnt/logs` usage, with a minimum of 100. The runbook defaults to 200.
+Set `LOGS_GB` (EBS `/dev/sdg`) to at least 2 × the current `/mnt/logs` usage. The Ansible README suggests 64 GiB as a starting point; today these logs sit on a 950 GB NVMe, so measure before choosing.
 
 ### 2.4 Same rollup version everywhere
 On each old node:
@@ -204,7 +238,7 @@ grep -rnE "c8gd|C8GD|aws_raid_0|aws_ebs_backup_node_raid_0|/dev/sdf|DISK_PROFILE
 2. **Same three templates:** add a logs volume on `/dev/sdg`. That's the device name `aws_single_nvme_ebs_logs` and `aws_ebs_backup_node_single_nvme` look for. Keep the existing root volume, and keep `/dev/sdf` on the backup unchanged:
    ```ts
    { deviceName: '/dev/sdg',
-     volume: ec2.BlockDeviceVolume.ebs(200 /* LOGS_GB from §2.3 */, {
+     volume: ec2.BlockDeviceVolume.ebs(LOGS_GB /* from §2.3 */, {
        volumeType: ec2.EbsDeviceVolumeType.GP3, encrypted: true, deleteOnTermination: true }) },
    ```
 3. **Runtime values documents:** set `DISK_PROFILE` to `aws_single_nvme_ebs_logs` for primary and secondary, and `aws_ebs_backup_node_single_nvme` for backup. Both profiles exist in `rollup-starter-ansible@cdk-deployment-october-2026` (`roles/common/defaults/main.yaml`); the backup profile requires `SEQUENCER_KIND=standard`, which the backup already uses.
