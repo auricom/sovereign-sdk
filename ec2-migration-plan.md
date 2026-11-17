@@ -1,986 +1,410 @@
-# Runbook: migrate dev sequencers from i8g.12xlarge to i8g.4xlarge with no downtime
+# Runbook: migrate the relay-devnet sequencers (`SovRollupCdkStarterStack`) from c8gd.12xlarge to i8g.4xlarge with no downtime
 
-> Nothing in this runbook has been executed. All commands are meant to be run by a human, in order, one environment at a time.
-> There's no Terraform for the dev servers yet. AWS resources are created and removed **manually with the `aws` CLI**, and hosts are configured with **Ansible**. Ansible snippets are templates: adapt role, variable and inventory names to your Ansible repo. Every AWS resource created here is tagged and logged (§3.0), so the future Terraform codebase can import it.
-> Everything about sequencer behaviour (roles, leader election, endpoints) comes from the SDK source in this repo.
-
----
-
-## 0. Background (read once)
-
-### 0.1 Hardware change (confirm in §2.9)
-
-| | i8g.12xlarge | i8g.4xlarge |
-|---|---|---|
-| vCPU | 48 | 16 |
-| RAM | 384 GiB | 128 GiB |
-| Instance-store NVMe | 3 × 3750 GB → RAID0 ≈ 11.25 TB | **1 × 3750 GB, no RAID** |
-| Disk IOPS/throughput | about 3 drives striped | **about ⅓ of today** |
-
-### 0.2 How a no-downtime cutover works (SDK behaviour)
-
-- Config `[…postgres_config]`: `postgres_connection_string`, `node_id` (must be unique), `node_role` ∈ `Leader | Replica | ReplicaNoLeaderSync | DbElected`, `leader_election { leader_timeout_millis=1000, grace_period_millis=10000, heartbeat_interval_millis=100 }`.
-- `Replica`: syncs from the leader through Postgres and **never** competes for leadership. Used while the new nodes catch up.
-- `DbElected`: starts as a replica. If the leader stops heartbeating for >1 s (and has been leader for >10 s), it takes leadership, **exits**, and must be restarted by systemd. It then comes back as the batch producer.
-- `Leader`: **always** starts as batch producer, even if another node already leads. It exits on its first heartbeat if it isn't the leader. ⇒ never (re)start a `Leader`-configured node while another node leads. That's why old nodes are `mask`ed below.
-- Result: reads never stop. Writes (tx submit / soft confirmations) pause for **about 1 s plus the new leader's restart time** at cutover. The SDK has no hot handover.
-- **Hard prerequisite:** dev must run with `postgres_config` set. If it uses the RocksDB backend (no `postgres_config`), you can't have a no-downtime cutover. Stop here and plan a maintenance window instead.
-
-### 0.3 Strategy
-1. Add new 4xlarge hosts next to the old ones (never modify the old ones in place).
-2. Seed the new hosts' data by **restoring the latest snapshot taken by the backup node** (§7). The new nodes then only replay the few DA blocks since the snapshot. No old node is stopped during seeding.
-3. Run the new hosts as `Replica` until they're at head, and soak them.
-4. Set one new node to `DbElected`, stop and mask the old leader, and the new node takes over.
-5. Soak, then destroy the old hosts.
+> **Checked on 2026-11-17** against AWS account `313110633477` / `us-east-1` with the read-only profile `ReadOnlyAccess-313110633477`. Nothing has been changed in the account.
+> Commands marked **[write]** need a profile with write access and are run by a human. Every other command is read-only.
+> Node access is through **SSM Session Manager**: all nodes are registered and `Online`, running Ubuntu 24.04.
 
 ---
 
-## 1. Variables (set in every shell you use)
+## 0. What the account really contains
 
-```bash
-export ENV=<dev-env-name>
-export AWS_REGION=<region>
-export AWS_PROFILE=<profile>
-export SVC=<rollup systemd unit, e.g. rollup.service>
-export SVC_USER=<user the service runs as>
-export DATA=<data mount point, e.g. /mnt/data>
-export ROLLUP_DIR=<rollup data dir = [storage] path, e.g. /mnt/data/rollup>
-export CFG=<rollup config toml path on hosts>
-export API=<rollup REST port>
-export PGURL='postgresql://<user>:<pass>@<host>:5432/<db>'
-export SSH_USER=<ssh user>
-export OLD_LEADER=<private ip>
-export OLD_REPLICAS="<ip> <ip>"          # may be empty
-export NEW1=<ip>                         # filled after §3.2; this one becomes the leader
-export NEW2=<ip>                         # standby
-export NEW_NODES="$NEW1 $NEW2"
-export WRITE_ENDPOINT=<host:port clients use to submit txs>
-export BACKUP_NODE=<ip of the backup node that takes snapshots>
-export SNAP_URI=<s3://bucket/prefix where snapshots land, e.g. s3://<bucket>/<env>/>   # S3 variant (§7.A)
-export TG_ARN=<target group arn, if an LB is used (§2.7 d)>
-# OLD_LEADER_ID, OLD_IDS, NEW1_ID, NEW2_ID, NEW1, NEW2 are set in §3 and appended to the migration log:
-# in any new shell run `source ~/i8g-migration-$ENV.env`
-```
+### 0.1 Corrections to the earlier version of this runbook
 
-Find the values on an old host:
-
-```bash
-ssh $SSH_USER@$OLD_LEADER
-systemctl list-units --type=service | grep -Ei 'rollup|sov|sequencer'
-systemctl cat $SVC                                   # ExecStart → binary + config path, User=, Restart=
-grep -nE '^\[|path|node_id|node_role|postgres_connection_string|bind_port|bind_host' $CFG
-findmnt -no SOURCE,FSTYPE,OPTIONS $DATA
-```
-
----
-
-## 2. Pre-flight on the old hosts (read-only), go/no-go
-
-Run on **each** old host and write the numbers down.
-
-### 2.1 Disk layout and filesystem
-```bash
-lsblk -o NAME,MODEL,SIZE,TYPE,MOUNTPOINT
-cat /proc/mdstat
-sudo mdadm --detail /dev/md0
-findmnt -no SOURCE,FSTYPE,OPTIONS $DATA     # reuse this FSTYPE + options on the new hosts
-grep -E 'md0|'"$DATA" /etc/fstab
-```
-
-### 2.2 Disk usage and growth
-```bash
-df -h $DATA
-sudo du -sh $ROLLUP_DIR/* | sort -h
-sudo ls -la $ROLLUP_DIR                       # list everything; note any non-DB files (keys, configs)
-```
-Prometheus (node_exporter): growth per day and projected free space in 90 d:
-```promql
--deriv(node_filesystem_avail_bytes{mountpoint="<DATA>", instance=~"<old hosts>"}[7d]) * 86400
-predict_linear(node_filesystem_avail_bytes{mountpoint="<DATA>"}[30d], 90*86400)
-```
-**Go if:** used ≤ **3.0 TB** and projected usage in 90 d ≤ ~3.2 TB. Otherwise enable or tighten `[storage.pruner]`, or use i8g.8xlarge (2 × 3750 GB) instead.
-
-### 2.3 NOMT hashtable size (can't be reduced after creation)
-```bash
-grep -nE 'hashtable_buckets|preallocate_ht|page_cache|leaf_cache|state_cache_size|commit_concurrency|num_cache_warmup_workers' $CFG
-sudo find $ROLLUP_DIR -name 'ht' -o -name '*.ht' | xargs -r sudo ls -lh
-```
-The ht file is about `buckets × 4 KiB`. **Go if** all ht files plus the other data fit in 3.0 TB.
-
-### 2.4 Memory
-```bash
-free -g
-ps -o pid,rss,vsz,cmd -C <binary-name>          # RSS in KiB
-```
-PromQL: `max_over_time(process_resident_memory_bytes{instance=~"<old hosts>"}[7d])`
-**Go if** peak RSS plus planned cache sizes ≤ ~90 GiB. Otherwise reduce caches in §5.
-
-### 2.5 CPU and disk IO load
-```bash
-uptime; nproc
-mpstat 5 6                                       # sysstat package
-iostat -xm 5 6 /dev/md0 /dev/nvme*n1             # r/s, w/s, rMB/s, wMB/s, %util at peak
-```
-Write down peak `r/s + w/s` and MB/s on `md0`. You'll compare them to the fio result on the new host (§6.2). **Go if** the peak is < 50% of what a single new drive can do.
-
-### 2.6 Cluster topology and Postgres
-```bash
-psql "$PGURL" -c "SELECT node_id, last_updated, leader_acquired_at FROM sequencer_leader;"
-psql "$PGURL" -c "SELECT node_id, address, now()-last_updated AS age FROM nodes ORDER BY node_id;"
-psql "$PGURL" -c "SHOW max_connections;" -c "SELECT count(*) FROM pg_stat_activity;"
-```
-Write down the leader's `node_id` and IP, every replica, and each node's `node_role` (in `$CFG`).
-Seeding uses the backup node's snapshot (§2.11, §7), so having no old replica is fine. Old replicas only serve as a fallback data source (§7.D).
-
-### 2.7 How clients reach the cluster
-Find out how **writes** reach the leader today and write it down. Pick one:
-- (a) proxy using `sov-proxy-utils` node discovery (follows `sequencer_leader` automatically): nothing to do at cutover
-- (b) Elastic IP on the leader: reassociate at cutover (§11.4)
-- (c) DNS record pointing at the leader: **lower TTL to 30 s at least 24 h before cutover** and update it at cutover (§11.4)
-- (d) LB target group: register/deregister (§9, §11)
-
-Also check who else talks to a specific host directly (prover, indexer, explorer, relayer, monitoring) and plan to repoint them.
-
-### 2.8 Old leader systemd settings (needed for rollback)
-```bash
-systemctl show $SVC -p Restart,RestartUSec,TimeoutStopUSec,User
-```
-
-### 2.9 AWS checks
-```bash
-aws ec2 describe-instance-types --instance-types i8g.4xlarge i8g.12xlarge \
-  --query 'InstanceTypes[].{type:InstanceType,vcpu:VCpuInfo.DefaultVCpus,mem:MemoryInfo.SizeInMiB,disks:InstanceStorageInfo.Disks,net:NetworkInfo.NetworkPerformance}' --output table
-aws ec2 describe-instance-type-offerings --location-type availability-zone \
-  --filters Name=instance-type,Values=i8g.4xlarge --query 'InstanceTypeOfferings[].Location'
-aws ec2 describe-instances --filters "Name=tag:Name,Values=*<sequencer name pattern>*" \
-  --query 'Reservations[].Instances[].{id:InstanceId,type:InstanceType,ip:PrivateIpAddress,az:Placement.AvailabilityZone,name:Tags[?Key==`Name`]|[0].Value,state:State.Name}' --output table
-aws service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A   # Running On-Demand Standard vCPUs
-```
-**Go if** i8g.4xlarge is offered in the same AZ(s) and the vCPU quota covers old + new instances running at the same time (+16 vCPU per new node).
-
-### 2.10 Freeze
-- Pause automatic deploys to dev (CI/CD, Ansible cron, Renovate auto-deploys) for the whole migration. An automated redeploy could restart an old node as `Leader` after cutover.
-- Tell dev users which window the ~seconds-long write pause will happen in.
-
-### 2.11 Backup node snapshots (read-only), go/no-go
-The SDK has no built-in snapshot command, so snapshots are whatever the backup node's job produces. First find out exactly what that job does:
-
-```bash
-ssh $SSH_USER@$BACKUP_NODE
-systemctl list-timers --all | grep -Ei 'snap|backup'
-sudo crontab -l; ls /etc/cron.d/; grep -rlEi 'snap|backup' /etc/cron.d /etc/systemd/system 2>/dev/null
-systemctl cat <snapshot unit>                      # find the script it runs
-sudo cat <snapshot script>                         # read it end to end
-grep -nE '^\[|path|_db_path|hashtable_buckets|preallocate_ht' <backup node config toml>
-<rollup binary> --version                          # version that writes the snapshots
-```
-
-From the script, write down:
-
-| Question | Why it matters |
+| Earlier assumption | What the account shows |
 |---|---|
-| **Format and location**: tar(.zst/.gz/.lz4) archive in S3 (→ §7.A), EBS snapshot of a data volume (→ §7.B), or a directory/archive on the backup node's own disk (→ §7.C) | Decides which restore procedure to use |
-| **Consistency**: is the rollup service **stopped** (or are NOMT and RocksDB checkpointed) while the snapshot is taken? | A copy of live NOMT/RocksDB files can't be opened. If the script copies files from a running node, don't use it: fix the script or use §7.D |
-| **Contents**: which dirs are inside (`state-db`, `ledger`, `user_nomt_db`, … per `[storage]` paths) and the archive's top-level path | Must match the sequencer's `[storage]` layout. Decides `--strip-components` |
-| **Height**: rollup slot / DA height at snapshot time (manifest file, object tags, or log line) | Used to check the state root after restore and to estimate catch-up time |
-| **Checksum**: is a `.sha256` written next to the archive? | Integrity check after download |
-| **Frequency and retention** | Pick a snapshot that's < 24 h old |
+| Current type i8g.12xlarge | **c8gd.12xlarge**: 48 vCPU, **96 GiB** RAM, **3 × 950 GB** NVMe |
+| Instances created by hand, no IaC | AWS **CDK / CloudFormation stack `SovRollupCdkStarterStack`**. Each node is the single instance of its own **Auto Scaling group** (min 1 / desired 1), launched from a launch template |
+| RAID built by hand | Built at boot by **Ansible** (`Sovereign-Labs/rollup-starter-ansible`, branch `cdk-deployment-october-2026`, `roles/common/tasks/disks.yaml`) run via `ansible-pull` from user data. The layout comes from `DISK_PROFILE` in an SSM document. **Single-NVMe profiles already exist in that branch**, so no Ansible code changes are needed |
+| Snapshot format unknown | Every hour the backup node stops rollup, rsyncs `/mnt/rollup` to an EBS volume on `/dev/sdf` and takes an **EBS snapshot** (retention ≈ 0 h / 6 h / 1 d / 1 w / 1 mo). Every node already has the restore script **`/home/ubuntu/restore-from-snapshot.sh <snap-id>`** |
+| Write routing unknown | The proxy (t3.small, EIP `44.193.19.138`, `relay-devnet.sovereign-labs.xyz`) runs **node-discovery** against Postgres. Writes go to the leader. Reads go only to followers whose `/sequencer/ready` returns 200. **Nothing to switch by hand** |
+| Postgres somewhere | **Aurora PostgreSQL 17.9**: writer in us-east-1a, reader in us-east-1b (db.r8g.large) |
+| Node IDs set by hand | `rollup_node_id` = **EC2 instance ID**, set automatically by the render script |
 
-Then check a candidate snapshot (S3 example; adjust for EBS: `aws ec2 describe-snapshots --owner-ids self --filters Name=tag:Name,Values=<pattern> --query 'reverse(sort_by(Snapshots,&StartTime))[:5].[SnapshotId,StartTime,VolumeSize,State]' --output table`):
+### 0.2 Inventory
 
-```bash
-aws s3 ls $SNAP_URI --human-readable | sort | tail -5
-export SNAP_OBJ=${SNAP_URI%/}/<latest-archive-name>          # e.g. .../rollup-20261117T0300Z.tar.zst
-aws s3api head-object --bucket <bucket> --key <prefix/latest-archive-name> \
-  --query '{size:ContentLength,modified:LastModified,meta:Metadata}'
-aws s3 cp ${SNAP_OBJ}.sha256 - 2>/dev/null                    # if the job writes one
-aws s3 cp ${SNAP_URI%/}/<manifest file> - 2>/dev/null         # if the job writes one (height, version, …)
-# List the archive's top-level layout without downloading it all (stops after 50 entries)
-aws s3 cp $SNAP_OBJ - | zstd -dc | tar -tf - | head -50
-```
+| Role | ASG (`desired/min/max`) | Instance | AZ / IP | Launch template | `DISK_PROFILE` today | Sequencer | Election role |
+|---|---|---|---|---|---|---|---|
+| Primary | `SovRollupCdkStarterStack-SovRollupComputePrimaryAsgASG448C4328-fVa4yPZ43E36` (1/1/2) | `i-0baeb42dfeb96cb28` | us-east-1a / 10.0.2.21 | `lt-02a6dc4c5d8cfdc99` (latest v44, instance from v39) | `aws_raid_0` | preferred | `DbElected` |
+| Secondary | `SovRollupCdkStarterStack-SovRollupComputeSecondaryAsgASG8224C640-PKqRyQODK3bD` (1/0/3) | `i-0c9228ec8b0fa847a` | us-east-1b / 10.0.3.143 | `lt-05cf24139fde86881` (v44, instance v39) | `aws_raid_0` | preferred | `DbElected` |
+| Backup | `SovRollupCdkStarterStack-SovRollupComputeBackupNodeAsgASGF12DEAEF-v241AoY1q69R` (1/1/2) | `i-0cc24aae7b0454089` | us-east-1a / 10.0.2.196 | `lt-0e54a3c6b1a4f422e` (v44, instance v39) | `aws_ebs_backup_node_raid_0` | standard (not part of the election) | – |
+| Proxy (not migrated) | `…ProxyAsgASGB1045D50-nWkwreNMu6YC` | `i-035616ee95eaccd94` | us-east-1a / 10.0.0.9 | `lt-02bdfa1164fba9ea6` | – | – | – |
 
-**Go if all are true:**
-- The snapshot was taken from a **cleanly stopped** node (or a proper DB checkpoint).
-- It was written by the **same rollup version** as the running cluster (§1 `systemctl cat`, `<binary> --version` on `$OLD_LEADER`). Never restore a snapshot from a newer version than the binary you'll run.
-- The backup node's `*_hashtable_buckets` / `*_preallocate_ht` equal the sequencers' (§2.3). Buckets can't be changed after creation.
-- Its **uncompressed** size is ≤ 3.0 TB. Check the manifest or `du` on the backup node.
-- It's < 24 h old and its DA height is still served by the DA node (pruning window).
-- It contains every dir the sequencer's `[storage]` config expects (compare with `sudo ls -la $ROLLUP_DIR` on an old sequencer from §2.2). If a sequencer has dirs the snapshot lacks (e.g. the backup node is a plain full node), don't guess: confirm with the SDK team that starting with those dirs missing is safe, or use §7.D.
+- All three rollup nodes use security group `sg-0e90e09ed3975a293`. Aurora accepts 5432 from that SG, and the proxy reaches 12346/3000 through it. **New instances get the same SG from the launch template, so no SG changes are needed.**
+- Today's `aws_raid_0` layout: NVMe 1 + 2 in RAID0 at `/mnt/rollup` (ext4, 1.9 TB), NVMe 3 at `/mnt/logs`. The backup node also has EBS `/dev/sdf` (`vol-0b7f605d6d0900a4a`, 1800 GiB gp3, 30k IOPS) at `/mnt/snapshots`.
+- Launch template **v44** (the ASGs' current version) differs from **v39** (what the running instances booted from) only in the AMI (`ami-09a93d801db0bafae`, Ubuntu 24.04 arm64) and the Ansible branch (`cdk-deployment-june-2026` → `cdk-deployment-october-2026`).
 
----
+### 0.3 Sizing check: GO
 
-## 3. AWS CLI: launch the new instances (never modify the old ones)
+| | c8gd.12xlarge (today) | i8g.4xlarge (target) | Verdict |
+|---|---|---|---|
+| vCPU | 48 | **16** | Over 14 days, CloudWatch shows: average ≤ 0.4%, highest hourly average 1.4%, highest 1-min peak **14%** (secondary). That's ≈ 6.7 vCPU, or ≈ 42% of 16. **OK**. Ansible compiles the rollup at boot, so first boot is ~3× slower |
+| RAM | 96 GiB | **128 GiB** | More RAM than today |
+| Rollup disk | RAID0 2 × 950 GB = 1.9 TB | **1 × 3750 GB**, no RAID | Data = **944 GB** (last snapshot's `FullSnapshotSizeInBytes`), including the ~800 GiB NOMT hashtable (`user_hashtable_buckets: 210000000`). **Fits** |
+| Logs disk | 3rd NVMe (950 GB) | new **EBS gp3 on `/dev/sdg`** | Size it in §2.3 |
+| Capacity | – | i8g.4xlarge offered in us-east-1a/b/c/d | **OK** |
+| vCPU quota | 512 | +16 during each swap (peak 162) | **OK** |
 
-There's no Terraform yet, so every AWS change is a manual `aws` CLI command run by a human. Run each command that changes something with `--dry-run` first: it checks permissions and parameters and creates nothing. **Record every ID you create in the migration log (§3.0).** It's the only state, and it's what the future Terraform codebase will import.
+### 0.4 How the no-downtime switch works (SDK behaviour)
+- Primary and secondary run with `node_role = "DbElected"` and leader election in Aurora (`leader_timeout` 1 s, `grace_period` 10 s, `heartbeat` 100 ms, which are the defaults because the CDK parameters are empty).
+- A `DbElected` node that isn't leader runs as a Postgres-synced replica. When the leader stops heart-beating for > 1 s, a replica takes leadership, **exits**, and is restarted by systemd as the batch producer. `rollup.service` has `Restart=always`, `RestartSec=3`.
+- **Reads** never stop. **Writes** pause for about 1 s plus the restart time when the leader node is retired (§4.6).
+- A node that is still syncing returns non-200 on `/sequencer/ready`, so node-discovery keeps it out of read routing. Clients never see a stale node.
+- The backup node is a *standard* sequencer and isn't part of the election. Swapping it has no client impact.
 
-Don't resize in place. `stop → modify-instance-attribute --instance-type → start` wipes the instance store (the RAID) and is downtime. **Never stop or start the old instances.**
+### 0.5 Strategy (one node at a time)
+For each node:
+1. Activate a new launch template version (i8g.4xlarge plus an EBS logs volume) and the single-NVMe `DISK_PROFILE`.
+2. Scale its ASG from 1 to 2. The new instance boots and Ansible sets up the single NVMe.
+3. Restore the latest backup snapshot onto it. It catches up and becomes ready, and the proxy adds it automatically.
+4. Detach the old instance from the ASG and stop rollup on it. For the leader, this is the failover.
+5. Let it run for a while, then terminate the old instance.
 
-### 3.0 Migration log
-```bash
-export LOG=~/i8g-migration-$ENV.env
-echo "# i8g migration $ENV started $(date -u +%FT%TZ)" >> $LOG
-# Append every ID you create, e.g. echo "NEW1_ID=i-…" >> $LOG
-# In a new shell:  source $LOG
-```
+**Order: non-leader preferred node → leader preferred node → backup node.** The backup goes last so its snapshots stay the restore source for the first two.
 
-### 3.1 Capture the old instances' settings
-```bash
-export OLD_LEADER_ID=<instance id of the old leader>
-export OLD_IDS="<old leader id> <old replica ids…>"
-echo "OLD_IDS=\"$OLD_IDS\"" >> $LOG
-
-aws ec2 describe-instances --instance-ids $OLD_LEADER_ID --query 'Reservations[0].Instances[0].{ami:ImageId,arch:Architecture,subnet:SubnetId,az:Placement.AvailabilityZone,sgs:SecurityGroups[].GroupId,profile:IamInstanceProfile.Arn,key:KeyName,root:RootDeviceName,imds:MetadataOptions.HttpTokens}' --output json
-aws ec2 describe-instances --instance-ids $OLD_LEADER_ID --query 'Reservations[0].Instances[0].Tags' --output table
-aws ec2 describe-volumes --filters Name=attachment.instance-id,Values=$OLD_LEADER_ID \
-  --query 'Volumes[].{dev:Attachments[0].Device,size:Size,type:VolumeType,iops:Iops,tp:Throughput,enc:Encrypted,kms:KmsKeyId,delOnTerm:Attachments[0].DeleteOnTermination}' --output table
-aws ec2 describe-instance-attribute --instance-id $OLD_LEADER_ID --attribute userData --query 'UserData.Value' --output text | base64 -d   # usually empty when Ansible does everything
-aws ec2 describe-addresses --filters Name=instance-id,Values=$OLD_LEADER_ID      # Elastic IP? (§2.7 b)
-```
-Copy the values into variables:
-```bash
-export AMI=<ImageId>
-export SUBNET=<SubnetId of the old leader>        # same AZ as the old leader and Postgres
-export SUBNET_B=<subnet for NEW2>                 # same as SUBNET, or the AZ the old replicas use
-export SGS="<sg-… sg-…>"
-export PROFILE_ARN=<IamInstanceProfile.Arn>
-export KEY=<KeyName>
-export ROOT_DEV=<RootDeviceName, e.g. /dev/sda1>
-export ROOT_SIZE=<GiB of the root volume>
-export EXTRA_TAGS='<tags from the old instance that monitoring / dynamic inventory / cost reports rely on, e.g. {Key=Project,Value=sovereign},>'
-```
-Check the AMI:
-```bash
-aws ec2 describe-images --image-ids $AMI --query 'Images[0].{name:Name,arch:Architecture,state:State,deprecated:DeprecationTime}'
-```
-It must be `arm64` (i8g is Graviton) and `available`. If it's been deregistered, use the current arm64 AMI of the **same distro release**. Ansible then brings the host to the same state.
-
-### 3.2 Launch the two instances
-```bash
-# $1 = index (0|1), $2 = subnet, other args go straight to run-instances (e.g. --dry-run)
-launch() {
-  aws ec2 run-instances "${@:3}" \
-    --image-id "$AMI" --instance-type i8g.4xlarge --count 1 \
-    --subnet-id "$2" --security-group-ids $SGS \
-    --iam-instance-profile Arn="$PROFILE_ARN" --key-name "$KEY" \
-    --block-device-mappings "DeviceName=$ROOT_DEV,Ebs={VolumeSize=$ROOT_SIZE,VolumeType=gp3,Encrypted=true,DeleteOnTermination=true}" \
-    --metadata-options HttpTokens=required,HttpEndpoint=enabled \
-    --disable-api-termination --disable-api-stop \
-    --tag-specifications \
-      "ResourceType=instance,Tags=[${EXTRA_TAGS}{Key=Name,Value=$ENV-sequencer-v2-$1},{Key=Env,Value=$ENV},{Key=Role,Value=sequencer},{Key=Migration,Value=i8g-4xl},{Key=ManagedBy,Value=manual}]" \
-      "ResourceType=volume,Tags=[{Key=Name,Value=$ENV-sequencer-v2-$1-root},{Key=Env,Value=$ENV}]" \
-    --query 'Instances[0].InstanceId' --output text
-}
-
-launch 0 "$SUBNET"   --dry-run      # expect: "DryRunOperation … Request would have succeeded"
-launch 1 "$SUBNET_B" --dry-run
-```
-- `--disable-api-stop` blocks accidental API stops (a stop wipes the instance store). Reboot still works.
-- `--disable-api-termination` blocks accidental termination. Both are lifted in §13 or §14.
-- If the old root volume uses a customer KMS key, add `KmsKeyId=<arn>` inside `Ebs={…}`.
-- No block-device mapping is needed for the NVMe drive: instance store on i8g is attached automatically.
-
-Launch for real (human):
-```bash
-NEW1_ID=$(launch 0 "$SUBNET");   echo "NEW1_ID=$NEW1_ID" >> $LOG
-NEW2_ID=$(launch 1 "$SUBNET_B"); echo "NEW2_ID=$NEW2_ID" >> $LOG
-aws ec2 wait instance-status-ok --instance-ids $NEW1_ID $NEW2_ID
-aws ec2 describe-instances --instance-ids $NEW1_ID $NEW2_ID \
-  --query 'Reservations[].Instances[].{id:InstanceId,name:Tags[?Key==`Name`]|[0].Value,type:InstanceType,ip:PrivateIpAddress,az:Placement.AvailabilityZone,state:State.Name}' --output table
-```
-```bash
-export NEW1=<private ip of v2-0> NEW2=<private ip of v2-1>; export NEW_NODES="$NEW1 $NEW2"
-echo "NEW1=$NEW1 NEW2=$NEW2" >> $LOG
-```
-`InsufficientInstanceCapacity` means AWS has no i8g.4xlarge free in that AZ right now. Retry later or use another subnet or AZ (Postgres latency matters for the leader: keep NEW1 close to Postgres).
-
-### 3.3 Network access
-The new hosts reuse the old SGs, so rules that reference the SG itself already apply. Rules that whitelist the **old hosts' IPs** don't. Check Postgres, the DA node, the LB/proxy and Prometheus:
-```bash
-aws ec2 describe-security-groups --group-ids <sg of Postgres / DA node / proxy> \
-  --query 'SecurityGroups[].{sg:GroupId,in:IpPermissions[].{p:FromPort,cidr:IpRanges[].CidrIp,sg:UserIdGroupPairs[].GroupId}}' --output json
-# Only if an old host's /32 is listed:
-aws ec2 authorize-security-group-ingress --group-id <sg> --dry-run \
-  --ip-permissions "IpProtocol=tcp,FromPort=<port>,ToPort=<port>,IpRanges=[{CidrIp=$NEW1/32,Description=$ENV-sequencer-v2-0},{CidrIp=$NEW2/32,Description=$ENV-sequencer-v2-1}]"
-# then without --dry-run, and log it:
-echo "SG_RULE <sg> <port> $NEW1/32 $NEW2/32" >> $LOG
-```
-If Postgres restricts clients in `pg_hba.conf` (Ansible-managed), add the new IPs there too.
-
-### 3.4 Snapshot read access (§7.A only)
-```bash
-ROLE=$(aws iam get-instance-profile --instance-profile-name "${PROFILE_ARN##*/}" --query 'InstanceProfile.Roles[0].RoleName' --output text); echo $ROLE
-aws iam list-role-policies --role-name $ROLE; aws iam list-attached-role-policies --role-name $ROLE   # maybe it can already read the bucket
-cat > /tmp/snapshot-read.json <<'EOF'
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    { "Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::<bucket>",
-      "Condition": { "StringLike": { "s3:prefix": ["<prefix>/*"] } } },
-    { "Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::<bucket>/<prefix>/*" },
-    { "Effect": "Allow", "Action": "kms:Decrypt", "Resource": "<kms key arn, remove this statement if the bucket uses SSE-S3>" }
-  ]
-}
-EOF
-aws iam put-role-policy --role-name $ROLE --policy-name $ENV-sequencer-snapshot-read --policy-document file:///tmp/snapshot-read.json
-echo "IAM_INLINE_POLICY $ROLE $ENV-sequencer-snapshot-read" >> $LOG
-ssh $SSH_USER@$NEW1 "aws s3 ls $SNAP_URI | tail -3"          # works within a few seconds
-```
-The role is shared with the old hosts, so they also get read access. That's harmless; remove it after the migration with `aws iam delete-role-policy --role-name $ROLE --policy-name $ENV-sequencer-snapshot-read`.
-
-S3 path: without an S3 gateway endpoint, multi-TB downloads go through the NAT gateway and you pay data-processing charges.
-```bash
-VPC=$(aws ec2 describe-subnets --subnet-ids $SUBNET --query 'Subnets[0].VpcId' --output text)
-aws ec2 describe-vpc-endpoints --filters Name=vpc-id,Values=$VPC Name=service-name,Values=com.amazonaws.$AWS_REGION.s3 \
-  --query 'VpcEndpoints[].{id:VpcEndpointId,type:VpcEndpointType,routeTables:RouteTableIds}'
-```
-If none is attached to the new subnet's route table, either accept the NAT cost or have the VPC owner add one.
-
-§7.B (EBS snapshot) only needs operator credentials with `ec2:CreateVolume`, `ec2:AttachVolume`, `ec2:DetachVolume`, `ec2:DeleteVolume` and `ec2:CreateTags`.
+### 0.6 ⚠ CDK drift
+The CDK stack owns the launch templates and SSM documents changed here by hand. Running instances are never touched by a deploy: the ASGs have no rolling-update policy. **But the next `cdk deploy` that modifies those resources reverts them** (for example, bumping `RollupCommitHash` rewrites the values documents). The next launched node would then come up as c8gd.12xlarge, or with `aws_raid_0` on an i8g.4xlarge, which fails at boot with *"Not enough instance store disks for RAID"*. **Port the changes to the CDK code (§7) before the next deploy.** I couldn't find the CDK source repo in the Sovereign-Labs GitHub org; it may be private.
 
 ---
 
-## 4. Ansible: inventory and disk provisioning
+## 1. Variables
 
-### 4.1 Inventory
-Put the new hosts in their **own group**, so every run can be `--limit`ed to them and the old hosts are never touched. Make it a child of the existing sequencer group so it inherits the same vars (binary version, secrets, Postgres URL, monitoring):
-
-```yaml
-# inventories/<dev>/hosts.yml (static inventory)
-all:
-  children:
-    sequencers:                     # existing group, old hosts unchanged
-      hosts:
-        <old hosts …>:
-      children:
-        sequencers_v2:
-          hosts:
-            <env>-sequencer-v2-0: { ansible_host: <NEW1 ip> }
-            <env>-sequencer-v2-1: { ansible_host: <NEW2 ip> }
-```
-With the `amazon.aws.aws_ec2` dynamic inventory, add `keyed_groups: [{ key: tags.Migration, prefix: mig }]` and use the group `mig_i8g_4xl` instead of `sequencers_v2`.
-
-Per-host and per-group vars (use the variable names your config template already uses: `grep -rn 'node_role\|node_id' roles/ templates/`):
-```yaml
-# inventories/<dev>/host_vars/<env>-sequencer-v2-0.yml
-sequencer_node_id: <env>-seq-v2-0
-sequencer_node_role: Replica          # → DbElected in §10
-
-# inventories/<dev>/host_vars/<env>-sequencer-v2-1.yml
-sequencer_node_id: <env>-seq-v2-1
-sequencer_node_role: Replica          # → DbElected in §12
-
-# inventories/<dev>/group_vars/sequencers_v2.yml  (child-group vars override the parent's)
-data_mount: <same mount point as old, §2.1>
-rollup_service_enabled: false         # don't start before the data is restored (§8 flips it)
-rollup_service_state: stopped
-# + tuned storage settings from §5.1
-```
-Check (safe):
 ```bash
-ansible-inventory -i inventories/<dev> --graph
-ansible-inventory -i inventories/<dev> --host <env>-sequencer-v2-0      # merged vars: node_id, role, tuned values
-ansible -i inventories/<dev> sequencers_v2 -m ansible.builtin.ping
+export AWS_REGION=us-east-1
+export RO=ReadOnlyAccess-313110633477           # read-only checks
+export RW=<profile with write access to 313110633477>   # [write] steps
+export DOMAIN=relay-devnet.sovereign-labs.xyz
+export API=12346
+export LT_BASE=44                               # current latest version of the 3 launch templates
+export DOC_BASE=10                              # current default version of the 3 values documents
+export LOG=~/i8g-migration-relay-devnet.env     # every ID created is appended here
+
+export P_ASG=SovRollupCdkStarterStack-SovRollupComputePrimaryAsgASG448C4328-fVa4yPZ43E36
+export P_LT=lt-02a6dc4c5d8cfdc99
+export P_OLD=i-0baeb42dfeb96cb28
+export P_DOC=SovRollupCdkStarterStack-runtime-config-values-primary
+
+export S_ASG=SovRollupCdkStarterStack-SovRollupComputeSecondaryAsgASG8224C640-PKqRyQODK3bD
+export S_LT=lt-05cf24139fde86881
+export S_OLD=i-0c9228ec8b0fa847a
+export S_DOC=SovRollupCdkStarterStack-runtime-config-values-secondary
+
+export B_ASG=SovRollupCdkStarterStack-SovRollupComputeBackupNodeAsgASGF12DEAEF-v241AoY1q69R
+export B_LT=lt-0e54a3c6b1a4f422e
+export B_OLD=i-0cc24aae7b0454089
+export B_DOC=SovRollupCdkStarterStack-runtime-config-values-backup
+export SNAP_VOL=vol-0b7f605d6d0900a4a           # old backup node's /dev/sdf: source of all restores
 ```
-
-### 4.2 Disk role: 1 NVMe → no RAID, several → RAID0
-Replace the fixed-3-device mdadm tasks in the disk role. Keep the **same mount point and filesystem type** as `findmnt` showed in §2.1, so no service or config paths change.
-```yaml
-- name: Discover instance-store NVMe devices
-  ansible.builtin.set_fact:
-    nvme_store: >-
-      {{ ansible_devices | dict2items
-         | selectattr('value.model', 'search', 'Instance Storage')
-         | map(attribute='key') | map('regex_replace', '^', '/dev/') | sort | list }}
-
-- name: Require at least one instance-store device
-  ansible.builtin.assert:
-    that: nvme_store | length >= 1
-
-- name: Pick data device
-  ansible.builtin.set_fact:
-    data_dev: "{{ nvme_store[0] if nvme_store | length == 1 else '/dev/md0' }}"
-
-- name: Create RAID0 (only on multi-disk instance types)
-  ansible.builtin.command: >
-    mdadm --create /dev/md0 --level=0 --raid-devices={{ nvme_store | length }} --run {{ nvme_store | join(' ') }}
-  args: { creates: /dev/md0 }
-  when: nvme_store | length > 1
-
-- name: Persist mdadm config (only on multi-disk instance types)
-  ansible.builtin.shell: mdadm --detail --scan > /etc/mdadm/mdadm.conf && update-initramfs -u
-  when: nvme_store | length > 1
-
-- name: Create filesystem (no-op if one exists)
-  community.general.filesystem:
-    fstype: xfs
-    dev: "{{ data_dev }}"
-
-- name: Read filesystem UUID
-  ansible.builtin.command: blkid -o value -s UUID {{ data_dev }}
-  register: data_uuid
-  changed_when: false
-
-- name: Mount data volume
-  ansible.posix.mount:
-    path: "{{ data_mount }}"
-    src: "UUID={{ data_uuid.stdout }}"
-    fstype: xfs
-    opts: defaults,noatime,nofail
-    state: mounted
-```
-Remove any hard-coded `/dev/md0` from other roles or templates (fstab, node_exporter mountpoint filters, alerts).
-
-**Never run this updated role on the old hosts.** Their fstab entry would switch from `/dev/md0` to `UUID=…` and the data volume would be remounted. Every run stays `--limit sequencers_v2` until the old hosts are gone (§13).
-
-### 4.3 No Ansible disk role today? One-off script
-If the RAID on the old hosts was built by hand, run this once per new host instead of §4.2: `ssh $SSH_USER@$NEW1 'sudo bash -s' < setup-nvme.sh`
-```bash
-#!/usr/bin/env bash
-# setup-nvme.sh: idempotent; 1 instance-store NVMe → plain fs, several → RAID0
-set -euo pipefail
-MOUNT=<same mount point as old, §2.1>
-FSTYPE=xfs                        # match §2.1
-MDADM_CONF=/etc/mdadm/mdadm.conf  # RHEL/AL2023: /etc/mdadm.conf
-
-findmnt -rn "$MOUNT" >/dev/null && { echo "$MOUNT already mounted"; exit 0; }
-
-# Instance-store NVMe only. The EBS root reports model "Amazon Elastic Block Store".
-mapfile -t devs < <(lsblk -dpno NAME,MODEL | awk '/Amazon EC2 NVMe Instance Storage/{print $1}' | sort)
-(( ${#devs[@]} >= 1 )) || { echo "no instance-store NVMe found" >&2; exit 1; }
-
-if (( ${#devs[@]} == 1 )); then
-  dev="${devs[0]}"
-else
-  dev=/dev/md0
-  [ -e "$dev" ] || mdadm --create "$dev" --level=0 --raid-devices="${#devs[@]}" --run "${devs[@]}"
-  mdadm --detail --scan > "$MDADM_CONF"
-  update-initramfs -u || dracut -f
-fi
-
-# Format only if blank. Instance store survives reboot but is wiped on stop/start.
-blkid -o value -s TYPE "$dev" >/dev/null || mkfs.$FSTYPE -f "$dev"
-uuid=$(blkid -o value -s UUID "$dev")
-mkdir -p "$MOUNT"
-grep -q "$uuid" /etc/fstab || echo "UUID=$uuid $MOUNT $FSTYPE defaults,noatime,nofail 0 2" >> /etc/fstab
-mount "$MOUNT"
-```
+In a new shell: re-export the above, then `source $LOG`.
 
 ---
 
-## 5. Ansible: rollup config and systemd for the new hosts
+## 2. Pre-flight (read-only), go/no-go
 
-### 5.1 Config differences vs the old hosts
-The config template renders these from the §4.1 vars. Find the section that holds `node_role` in today's config with `grep -n -B5 node_role $CFG` on an old host. Same section, new values:
-```toml
-postgres_connection_string = "<same as old>"
-node_id   = "<env>-seq-v2-0"           # NEW2: "<env>-seq-v2-1"; must be unique
-node_role = "Replica"                  # Replica during sync; changed in §10 / §12
-# [leader_election]: identical to old nodes (or omitted on all)
+### 2.1 Nothing changed since this runbook was checked
+```bash
+aws --profile $RO autoscaling describe-auto-scaling-groups --auto-scaling-group-names $P_ASG $S_ASG $B_ASG \
+  --query 'AutoScalingGroups[].{asg:AutoScalingGroupName,desired:DesiredCapacity,max:MaxSize,ltv:LaunchTemplate.Version,inst:Instances[].[InstanceId,LifecycleState,HealthStatus]}' --output json
+aws --profile $RO ec2 describe-launch-templates --launch-template-ids $P_LT $S_LT $B_LT \
+  --query 'LaunchTemplates[].[LaunchTemplateId,LatestVersionNumber]' --output text            # all 44
+for d in $P_DOC $S_DOC $B_DOC; do aws --profile $RO ssm describe-document --name $d --query 'Document.[Name,DefaultVersion]' --output text; done   # all 10
+aws --profile $RO cloudformation describe-stacks --stack-name SovRollupCdkStarterStack --query 'Stacks[0].[StackStatus,LastUpdatedTime]' --output text
 ```
-Storage and sequencer tuning for 16 vCPU / 128 GiB (in `group_vars/sequencers_v2.yml`). Start from the old values and scale:
-```toml
-# [storage]
-state_cache_size          = <old ÷ 3>
-user_commit_concurrency   = <min(old, 4)>
-kernel_commit_concurrency = <min(old, 2)>
-user_page_cache_size      = <old ÷ 3>
-user_leaf_cache_size      = <old ÷ 3>
-kernel_page_cache_size    = <old ÷ 3>
-kernel_leaf_cache_size    = <old ÷ 3>
-user_hashtable_buckets    = <UNCHANGED: must match the restored DB>
-kernel_hashtable_buckets  = <UNCHANGED>
-# [sequencer]
-num_cache_warmup_workers  = <min(old, 8)>
-```
-Keep the same sequencer signing key and secrets, deployed by the same Ansible tasks as on the old hosts.
+If any value differs (someone deployed), update `LT_BASE` / `DOC_BASE` and re-read §0.2.
 
-### 5.2 systemd restart policy (required for DbElected takeover)
-Add to the rollup role, unless the unit template already has these settings:
-```yaml
-- name: Rollup service restart policy (DbElected takeover needs an automatic restart)
-  ansible.builtin.copy:
-    dest: "/etc/systemd/system/{{ rollup_service }}.d/override.conf"     # rollup_service = e.g. rollup.service
-    content: |
-      [Service]
-      Restart=always
-      RestartSec=1
-      TimeoutStopSec=300
-    mode: "0644"
-  notify: Reload systemd
+### 2.2 Which node is the leader
+Open a session on each preferred node (`aws --profile $RW ssm start-session --target $P_OLD`, then `$S_OLD`) and run:
+```bash
+curl -s localhost:12346/sequencer/role; echo
+curl -s -o /dev/null -w 'ready=%{http_code}\n' localhost:12346/sequencer/ready
+curl -s localhost:12346/ledger/slots/latest | jq -c '{number,state_root}'
 ```
-```yaml
-# handlers
-- name: Reload systemd
-  ansible.builtin.systemd:
-    daemon_reload: true
-```
-The task that manages the service must follow `rollup_service_enabled` / `rollup_service_state` (§4.1), so the new hosts get the binary and config **without starting**.
+Write down which one is the leader (`LEADER=P` or `LEADER=S`). **The other one is migrated first.**
 
-### 5.3 Run the playbook on the new hosts only
-Safe checks:
+### 2.3 Disks and logs volume size
+On each old node:
 ```bash
-ansible-lint roles/<disk-role> roles/<rollup-role>
-ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit sequencers_v2 --syntax-check
-ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit sequencers_v2 --list-tasks
-ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit sequencers_v2 --check --diff
+cat /proc/mdstat; lsblk -o NAME,MODEL,SIZE,MOUNTPOINTS
+df -h /mnt/rollup /mnt/logs /mnt/snapshots 2>/dev/null
+sudo du -sh /mnt/logs/* 2>/dev/null | sort -h | tail
 ```
-Apply (human):
+Set `LOGS_GB` (EBS `/dev/sdg`) to at least 2 × the current `/mnt/logs` usage, with a minimum of 100. The runbook defaults to 200.
+
+### 2.4 Same rollup version everywhere
+On each old node:
 ```bash
-ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit sequencers_v2
+grep -E '^(rollup_commit_hash|disk_profile|rollup_node_role|rollup_sequencer_kind|rollup_node_id)' /home/ubuntu/runtime_vars.yaml
 ```
-Verify:
+Every node must show `rollup_commit_hash: "40c49a68fc67c0990a2d8bbe5a472f7527b44885"`, the value new nodes get from SSM. **If an old node runs a different commit, stop.** New nodes would run a different binary from the one that wrote the snapshot.
+
+### 2.5 Snapshots are healthy
 ```bash
-ansible -i inventories/<dev> sequencers_v2 -b -m ansible.builtin.shell \
-  -a "systemctl is-active $SVC; systemctl show $SVC -p Restart; grep -nE 'node_id|node_role' $CFG; findmnt -no SOURCE,FSTYPE $DATA"
-# expect: inactive, Restart=always, the v2 node_id, Replica, the NVMe device (not md0)
+aws --profile $RO ec2 describe-snapshots --owner-ids self \
+  --filters Name=volume-id,Values=$SNAP_VOL Name=tag:AutomatedBackup,Values=true \
+  --query 'reverse(sort_by(Snapshots,&StartTime))[:4].[SnapshotId,StartTime,State,FullSnapshotSizeInBytes]' --output table
 ```
+The latest `completed` snapshot must be < 2 h old. On the backup node: `sudo tail -40 /mnt/logs/rollup-snapshot.log` should show `=== Snapshot complete ===` every hour, with no `ERROR`.
+
+### 2.6 Freeze
+Until §5 is done, don't do any of the following:
+- `cdk deploy` on `SovRollupCdkStarterStack`
+- the stack's `MigrateLiveNodesCommand`
+- `render_config.sh` / `run_ansible.sh` on the old nodes. They would read the new single-NVMe `DISK_PROFILE`, and Ansible would fail on hardware that doesn't match it.
+
+Tell dev users when the leader swap (a few seconds of write pause) will happen.
 
 ---
 
-## 6. Verify each new host
+## 3. One-time preparation **[write]**
 
+### 3.1 Stop the ASGs from replacing instances on their own
+The instance role can call `autoscaling:SetInstanceHealth`, so something on the nodes may mark an instance unhealthy. The ASG would then terminate it, possibly halfway through a restore.
 ```bash
-ssh $SSH_USER@$NEW1
-lsblk -o NAME,MODEL,SIZE,TYPE,MOUNTPOINT        # exactly 1 "Instance Storage" disk, mounted at $DATA
-cat /proc/mdstat                                # no md devices
-findmnt $DATA; df -h $DATA                      # ~3.4 TiB, expected fs type
-grep $DATA /etc/fstab                           # UUID=…, nofail
-nproc; free -g                                  # 16 / ~124
-psql "$PGURL" -c 'select 1'                     # Postgres reachable from new host
-curl -s -o /dev/null -w '%{http_code}\n' http://<DA RPC>/   # DA reachable
-```
-
-### 6.1 Reboot test (instance store must survive and remount)
-```bash
-sudo reboot
-# after reconnect:
-findmnt $DATA
-```
-
-### 6.2 Disk benchmark (compare with §2.5)
-```bash
-sudo apt-get install -y fio     # or dnf
-sudo fio --name=rr --filename=$DATA/fio.test --size=20G --rw=randread  --bs=4k --iodepth=64 --numjobs=4 --ioengine=io_uring --direct=1 --runtime=60 --time_based --group_reporting
-sudo fio --name=rw --filename=$DATA/fio.test --size=20G --rw=randwrite --bs=4k --iodepth=64 --numjobs=4 --ioengine=io_uring --direct=1 --runtime=60 --time_based --group_reporting
-sudo rm -f $DATA/fio.test
-```
-**Go if** the old peak `r/s + w/s` from §2.5 is < 50% of the fio IOPS.
-
----
-
-## 7. Seed data on the new hosts from the backup node's snapshot
-
-Both new hosts restore **the same** snapshot, **in parallel** and independently of each other. The service stays stopped (§5.2) until §8. No old node is touched. Use the subsection that matches the format you found in §2.11:
-
-- §7.A: archive in S3 (most common for instance-store hosts)
-- §7.B: EBS snapshot
-- §7.C: archive or directory kept on the backup node itself
-- §7.D / §7.E: fallbacks if no usable snapshot exists
-
-### 7.0 Prepare each new host (all variants)
-```bash
-ssh $SSH_USER@$NEW1                            # then the same on NEW2
-systemctl is-active $SVC                       # must print 'inactive'
-sudo apt-get install -y zstd pv jq tmux        # or dnf; use pigz / lz4 instead of zstd if the archive uses them
-aws --version && aws sts get-caller-identity   # §7.A only: snapshot read access from §3.4 works
-sudo mkdir -p $ROLLUP_DIR
-sudo ls -A $ROLLUP_DIR                         # must print nothing (empty dir)
-df -h $DATA                                    # free ≥ uncompressed snapshot size + 20%
-```
-
-Pin the snapshot chosen in §2.11 (same values on both hosts):
-```bash
-export SNAP_OBJ=<exact s3://… URI of the archive>          # §7.A
-export SNAP_ID=<snap-… id>                                 # §7.B
-export SNAP_SLOT=<rollup slot recorded for this snapshot>  # from the manifest/log; used in §8
-export STRIP=<n>     # --strip-components: number of leading path parts in the archive above the data dirs
-                     # e.g. entries "rollup/state-db/…" → 1 ; entries "state-db/…" → 0
-```
-
-### 7.A Snapshot is an archive in S3
-
-Stream download → checksum → decompress → extract in **one pipeline**. Don't download the archive to disk first: the archive plus the extracted data won't both fit on the single 3.75 TB drive.
-
-```bash
-# 1) Faster S3 transfers (written to ~/.aws/config of the current user)
-aws configure set default.s3.max_concurrent_requests 64
-aws configure set default.s3.multipart_chunksize 256MB
-
-# 2) Restore inside tmux so an SSH drop doesn't kill it (≈1–2 h per 3 TB)
-tmux new -s restore
-BUCKET=$(echo "$SNAP_OBJ" | cut -d/ -f3); KEY=$(echo "$SNAP_OBJ" | cut -d/ -f4-)
-SIZE=$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" --query ContentLength --output text)
-aws s3 cp "$SNAP_OBJ" - \
-  | pv -s "$SIZE" \
-  | tee >(sha256sum > /tmp/snapshot.sha256) \
-  | zstd -dc -T0 \
-  | sudo tar -xf - -C "$ROLLUP_DIR" --strip-components="$STRIP" --numeric-owner
-echo "exit codes: ${PIPESTATUS[*]}"          # every value must be 0, else wipe $ROLLUP_DIR and retry
-
-# 3) Integrity (if the backup job publishes a checksum)
-sleep 5; cut -d' ' -f1 /tmp/snapshot.sha256
-aws s3 cp "${SNAP_OBJ}.sha256" - | cut -d' ' -f1         # must be identical
-```
-For other formats, replace `zstd -dc -T0`: `.tar.gz` → `pigz -dc`, `.tar.lz4` → `lz4 -dc`, plain `.tar` → remove that stage. zstd also checks its own frame checksums, so a non-zero exit code means the archive is corrupt.
-
-Retry after a failure:
-```bash
-sudo find "$ROLLUP_DIR" -mindepth 1 -delete      # wipe the partial extract, then re-run step 2
-```
-
-### 7.B Snapshot is an EBS snapshot
-
-Create a temporary volume from the snapshot in the new host's AZ, attach it, copy the data onto the NVMe, then delete the volume. Do this for NEW1 and NEW2 (one volume each, in parallel).
-
-From an operator machine:
-```bash
-export NEW_ID=<instance id of NEW1 (then NEW2)>
-AZ=$(aws ec2 describe-instances --instance-ids $NEW_ID --query 'Reservations[0].Instances[0].Placement.AvailabilityZone' --output text)
-VOL=$(aws ec2 create-volume --snapshot-id $SNAP_ID --availability-zone $AZ \
-  --volume-type gp3 --iops 16000 --throughput 1000 \
-  --tag-specifications "ResourceType=volume,Tags=[{Key=Name,Value=$ENV-seq-v2-restore-tmp}]" \
-  --query VolumeId --output text); echo $VOL
-aws ec2 wait volume-available --volume-ids $VOL
-aws ec2 attach-volume --volume-id $VOL --instance-id $NEW_ID --device /dev/sdf
-aws ec2 wait volume-in-use --volume-ids $VOL
-```
-
-On the new host:
-```bash
-export VOL=<vol-… from above>
-DEV=$(readlink -f /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${VOL/-/})
-lsblk -f $DEV                                   # check partitions / fs type / md member
-sudo mkdir -p /mnt/snap
-sudo mount -o nouuid $DEV /mnt/snap             # xfs; for ext4 drop -o nouuid. Mounted rw so the journal can replay; the volume is thrown away after.
-                                                # partitioned → mount ${DEV}p1 ; md member(s) → sudo mdadm --assemble --run /dev/md9 <devs> then mount /dev/md9
-sudo ls -la /mnt/snap                           # locate the rollup data dir
-export SNAP_SRC=/mnt/snap/<path to rollup data dir>
-tmux new -s restore
-sudo rsync -aH --numeric-ids --info=progress2 $SNAP_SRC/ $ROLLUP_DIR/
-sudo umount /mnt/snap
-```
-Volumes created from snapshots load lazily from S3, so the copy is slower than the gp3 figures (expect ~200–500 MB/s). Fast Snapshot Restore on `$SNAP_ID` in that AZ removes the lazy loading but is billed per hour. Optional.
-
-Clean up from the operator machine:
-```bash
-aws ec2 detach-volume --volume-id $VOL && aws ec2 wait volume-available --volume-ids $VOL
-aws ec2 delete-volume --volume-id $VOL
-aws ec2 describe-volumes --filters "Name=tag:Name,Values=$ENV-seq-v2-restore-tmp" --query 'Volumes[].VolumeId'   # must be empty
-```
-
-### 7.C Snapshot kept on the backup node's own disk
-
-Pull it straight from the backup node. That node keeps running: you read a **finished** snapshot, never its live data dir. First pause the snapshot job so it doesn't rotate or delete the file mid-copy:
-```bash
-ssh $SSH_USER@$BACKUP_NODE "sudo systemctl stop <snapshot>.timer"     # or comment out the cron entry
-```
-On each new host:
-```bash
-ssh -A $SSH_USER@$NEW1
-tmux new -s restore
-# archive file:
-ssh $SSH_USER@$BACKUP_NODE "sudo cat <path/to/snapshot archive>" \
-  | pv | tee >(sha256sum > /tmp/snapshot.sha256) | zstd -dc -T0 \
-  | sudo tar -xf - -C "$ROLLUP_DIR" --strip-components="$STRIP" --numeric-owner
-echo "exit codes: ${PIPESTATUS[*]}"
-# …or a snapshot directory:
-sudo --preserve-env=SSH_AUTH_SOCK rsync -aH --numeric-ids --info=progress2 \
-  --rsync-path="sudo rsync" -e "ssh -o Compression=no" \
-  $SSH_USER@$BACKUP_NODE:<snapshot dir>/ $ROLLUP_DIR/
-```
-When both hosts are done:
-```bash
-ssh $SSH_USER@$BACKUP_NODE "sudo systemctl start <snapshot>.timer"
-```
-
-### 7.D Fallback: copy from a stopped old replica
-Use this only if no snapshot passes §2.11. Pick `SRC=<one of OLD_REPLICAS>`. Only this replica goes offline during the copy.
-
-```bash
-export SRC=<old replica ip>
-# 1) Take SRC out of read routing (§9 commands), then stop it gracefully
-ssh $SSH_USER@$SRC "sudo systemctl stop $SVC; systemctl is-active $SVC"      # must print 'inactive'
-# 2) On NEW1: copy
-ssh -A $SSH_USER@$NEW1
-sudo --preserve-env=SSH_AUTH_SOCK rsync -aH --numeric-ids --delete --info=progress2 \
-  --rsync-path="sudo rsync" -e "ssh -o Compression=no -o StrictHostKeyChecking=accept-new" \
-  $SSH_USER@$SRC:$ROLLUP_DIR/ $ROLLUP_DIR/
-# 3) Sizes must match exactly
-ssh $SSH_USER@$SRC "sudo du -sb $ROLLUP_DIR"; sudo du -sb $ROLLUP_DIR
-# 4) Restart SRC and put it back in routing
-ssh $SSH_USER@$SRC "sudo systemctl start $SVC"
-# 5) NEW1 → NEW2 (NEW1 not started yet, so its copy is consistent)
-ssh -A $SSH_USER@$NEW2
-sudo --preserve-env=SSH_AUTH_SOCK rsync -aH --numeric-ids --delete --info=progress2 \
-  --rsync-path="sudo rsync" -e "ssh -o Compression=no" \
-  $SSH_USER@$NEW1:$ROLLUP_DIR/ $ROLLUP_DIR/
-```
-
-### 7.E Fallback: sync from DA
-Leave `$ROLLUP_DIR` empty. This only works if the DA node still serves the rollup's first DA height and the NOMT ht file (§2.3) fits. Can take hours to days.
-
-### 7.1 After the restore (all variants), on each new host
-```bash
-sudo chown -R $SVC_USER: $ROLLUP_DIR
-sudo ls -la $ROLLUP_DIR          # same top-level dirs as an old sequencer (§2.2), with no extra nesting level (wrong $STRIP)
-sudo du -sh $ROLLUP_DIR/*        # sizes close to the old sequencer's / the manifest's
-df -h $DATA                      # ≥ 20% free
-grep -nE '^path|_db_path' $CFG   # [storage] paths point at the restored dirs
-```
-Only the **data** comes from the snapshot. The config (unique `node_id`, `node_role = "Replica"`) and the keys come from §5. If the snapshot contains config or key files, they're the backup node's, so don't use them.
-
----
-
-## 8. Start the new nodes as `Replica` and wait for head
-
-In `inventories/<dev>/group_vars/sequencers_v2.yml` set `rollup_service_enabled: true` and `rollup_service_state: started`, then:
-```bash
-ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit sequencers_v2 --check --diff   # only the service state should change
-ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit sequencers_v2
-ssh $SSH_USER@$NEW1 "journalctl -u $SVC -f"     # watch for errors; Ctrl-C when calm
-```
-
-### 8.0 Checks right after the first start from the snapshot
-```bash
-# The node must resume near the snapshot height, NOT from genesis
-for h in $NEW_NODES; do printf '%-16s ' $h; curl -s http://$h:$API/ledger/slots/latest | jq .number; done   # ≈ $SNAP_SLOT, then rising
-for h in $NEW_NODES; do curl -s http://$h:$API/rollup/sync-status | jq -c; done                          # Syncing → Synced
-
-# The restored state must be the canonical one: root at the snapshot height matches the leader's
-for h in $OLD_LEADER $NEW_NODES; do printf '%-16s ' $h; curl -s http://$h:$API/ledger/slots/$SNAP_SLOT | jq -r .state_root; done
-```
-**Stop the service and go back to §7** if:
-- the height starts at 0 or 1: the node didn't find the restored data (wrong `$STRIP` or `[storage]` path)
-- the service fails to open the DB: an inconsistent snapshot or a version mismatch (check `journalctl -u $SVC`)
-- the state roots differ
-
-To redo it: `sudo systemctl stop $SVC && sudo find $ROLLUP_DIR -mindepth 1 -delete`, then restore again.
-
-Catch-up time is roughly the DA blocks since the snapshot ÷ the replay rate. That's minutes to a few hours for a snapshot < 24 h old.
-
-### 8.1 Sync checks
-```bash
-# Height + root on every node (repeat until NEW* equal the leader and keep up)
-for h in $OLD_LEADER $OLD_REPLICAS $NEW_NODES; do
-  printf '%-16s ' $h; curl -s http://$h:$API/ledger/slots/latest | jq -c '{number, state_root}'
+for g in $P_ASG $S_ASG $B_ASG; do
+  aws --profile $RW autoscaling suspend-processes --auto-scaling-group-name $g --scaling-processes ReplaceUnhealthy AZRebalance
 done
-
-# Sync status and role of the new nodes
-for h in $NEW_NODES; do curl -s http://$h:$API/rollup/sync-status | jq -c; curl -s http://$h:$API/sequencer/role | jq -c; done
-
-# State roots must be identical at the same slot
-N=$(( $(curl -s http://$OLD_LEADER:$API/ledger/slots/latest | jq .number) - 5 ))
-for h in $OLD_LEADER $NEW_NODES; do printf '%-16s ' $h; curl -s http://$h:$API/ledger/slots/$N | jq -r .state_root; done
-
-# Registered in the cluster with a reachable address (private ip:port, not 0.0.0.0)
-psql "$PGURL" -c "SELECT node_id, address, now()-last_updated AS age FROM nodes ORDER BY node_id;"
-
-# No root mismatch / panics
-ssh $SSH_USER@$NEW1 "journalctl -u $SVC --since '-1h' | grep -Ei 'mismatch|panic|error' | tail -50"
+aws --profile $RO autoscaling describe-auto-scaling-groups --auto-scaling-group-names $P_ASG $S_ASG $B_ASG --query 'AutoScalingGroups[].SuspendedProcesses[].ProcessName'
 ```
 
-### 8.2 Soak ≥ 24 h as replicas, under real load
+### 3.2 New launch template versions (not used until §4.1)
+`--source-version 44` copies everything: AMI, user data, SG, instance profile and key pair. Fields given in `--launch-template-data` replace the source's. **`BlockDeviceMappings` is replaced as a whole**, so the root volume (and `/dev/sdf` on the backup) must be repeated.
 ```bash
-ssh $SSH_USER@$NEW1 'free -g; ps -o rss,cmd -C <binary-name>; df -h '$DATA'; iostat -xm 5 3; mpstat 5 3'
+LOGS_GB=200
+ROOT='{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":64,"VolumeType":"gp3"}}'
+LOGS='{"DeviceName":"/dev/sdg","Ebs":{"VolumeSize":'$LOGS_GB',"VolumeType":"gp3","Encrypted":true,"DeleteOnTermination":true}}'
+SNAP='{"DeviceName":"/dev/sdf","Ebs":{"VolumeSize":1800,"VolumeType":"gp3","Iops":30000,"Throughput":1000,"Encrypted":true,"DeleteOnTermination":true}}'
+newver() {  # $1 = template id, $2 = block device mappings, extra args (e.g. --dry-run)
+  aws --profile $RW ec2 create-launch-template-version "${@:3}" --launch-template-id "$1" --source-version $LT_BASE \
+    --version-description "i8g.4xlarge single-NVMe migration" \
+    --launch-template-data "{\"InstanceType\":\"i8g.4xlarge\",\"BlockDeviceMappings\":[$2]}" \
+    --query LaunchTemplateVersion.VersionNumber --output text
+}
+newver $P_LT "$ROOT,$LOGS" --dry-run; newver $S_LT "$ROOT,$LOGS" --dry-run; newver $B_LT "$ROOT,$SNAP,$LOGS" --dry-run
+P_LTV=$(newver $P_LT "$ROOT,$LOGS"); S_LTV=$(newver $S_LT "$ROOT,$LOGS"); B_LTV=$(newver $B_LT "$ROOT,$SNAP,$LOGS")
+echo "P_LTV=$P_LTV S_LTV=$S_LTV B_LTV=$B_LTV" | tee -a $LOG
 ```
-PromQL to check after 24 h:
-```promql
-max_over_time(process_resident_memory_bytes{instance=~"<new hosts>"}[24h])
-max_over_time(rate(node_disk_io_time_seconds_total{instance=~"<new hosts>",device=~"nvme.*"}[5m])[24h:])   # disk busy fraction
-1 - avg by (instance)(rate(node_cpu_seconds_total{mode="idle",instance=~"<new hosts>"}[5m]))
-```
-**Go to §9 if:** heights stay equal to the leader, state roots match, RSS < 75% of RAM, disk busy < 60%, CPU < 70%, no OOM (`journalctl -k | grep -i oom` is empty).
-
----
-
-## 9. Add the new nodes to read routing
-
-ALB/NLB example:
+Check that only `InstanceType` and `BlockDeviceMappings` changed:
 ```bash
-export TG_ARN=<target group arn>
-aws elbv2 describe-target-groups --target-group-arns $TG_ARN --query 'TargetGroups[0].{port:Port,hc:HealthCheckPath}'
-aws elbv2 register-targets --target-group-arn $TG_ARN --targets Id=$NEW1_ID,Port=$API Id=$NEW2_ID,Port=$API
-echo "TG_TARGETS $TG_ARN $NEW1_ID $NEW2_ID" >> $LOG
-aws elbv2 describe-target-health --target-group-arn $TG_ARN --output table   # wait for 'healthy'
+for x in "$P_LT $P_LTV" "$S_LT $S_LTV" "$B_LT $B_LTV"; do set -- $x
+  diff <(aws --profile $RO ec2 describe-launch-template-versions --launch-template-id $1 --versions $LT_BASE --query 'LaunchTemplateVersions[0].LaunchTemplateData' | jq -S 'del(.InstanceType,.BlockDeviceMappings)') \
+       <(aws --profile $RO ec2 describe-launch-template-versions --launch-template-id $1 --versions $2       --query 'LaunchTemplateVersions[0].LaunchTemplateData' | jq -S 'del(.InstanceType,.BlockDeviceMappings)') \
+  && echo "$1 v$2: only type + disks changed"
+done
 ```
-(Proxy with node discovery: nothing to do, the nodes are in the `nodes` table.)
-Watch the LB 5xx rate for 30 min.
+Creating a version doesn't change anything yet: the ASGs still point at v44.
 
----
+### 3.3 Prepare the new values documents (activated in §4.1)
+The values documents store each value base64-encoded: `DISK_PROFILE=$(printf '%s' '<base64>' | base64 -d)`.
 
-## 10. Make NEW1 the only leader candidate
+| Node | Old profile (base64) | New profile (base64) |
+|---|---|---|
+| primary, secondary | `aws_raid_0` (`YXdzX3JhaWRfMA==`) | `aws_single_nvme_ebs_logs` (`YXdzX3NpbmdsZV9udm1lX2Vic19sb2dz`): NVMe → `/mnt/rollup`, EBS `/dev/sdg` → `/mnt/logs` |
+| backup | `aws_ebs_backup_node_raid_0` (`YXdzX2Vic19iYWNrdXBfbm9kZV9yYWlkXzA=`) | `aws_ebs_backup_node_single_nvme` (`YXdzX2Vic19iYWNrdXBfbm9kZV9zaW5nbGVfbnZtZQ==`): plus EBS `/dev/sdf` → `/mnt/snapshots` and the hourly snapshot cron |
 
-Only NEW1 becomes `DbElected` now, so the winner is known in advance (simplifies EIP/DNS moves). NEW2 stays `Replica` until §12.
-In `inventories/<dev>/host_vars/<env>-sequencer-v2-0.yml` set `sequencer_node_role: DbElected`, then run on **that host only**:
 ```bash
-ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit <env>-sequencer-v2-0 --check --diff   # only node_role in $CFG changes
-ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit <env>-sequencer-v2-0
-ssh $SSH_USER@$NEW1 "grep -n node_role $CFG; systemctl show $SVC -p ActiveEnterTimestamp"
-```
-If the role has no restart handler on config changes, restart it yourself: `ssh $SSH_USER@$NEW1 "sudo systemctl restart $SVC"`. Then:
-```bash
-ssh $SSH_USER@$NEW1 "journalctl -u $SVC --since '-2min' | grep -E 'DbElected node did not acquire leadership|PgSyncReplica'"
-```
-Expect *"DbElected node did not acquire leadership, running as PgSyncReplica"*. Then re-run the §8.1 height check until NEW1 is back at head.
-
----
-
-## 11. Leader cutover
-
-### 11.1 Retire the old replicas first
-For each old replica:
-```bash
-aws elbv2 deregister-targets --target-group-arn $TG_ARN --targets Id=<old replica id>,Port=$API
-aws elbv2 describe-target-health --target-group-arn $TG_ARN --output table   # wait until 'draining' finishes
-ssh $SSH_USER@<old replica> "sudo systemctl disable --now $SVC && sudo systemctl mask $SVC"
-psql "$PGURL" -c "SELECT node_id FROM nodes ORDER BY node_id;"     # old replica gone
-```
-
-### 11.2 Last checks (all must be true)
-```bash
-psql "$PGURL" -c "SELECT node_id, now()-leader_acquired_at AS leading_for FROM sequencer_leader;"   # old leader, leading_for > 10s
-for h in $OLD_LEADER $NEW_NODES; do printf '%-16s ' $h; curl -s http://$h:$API/ledger/slots/latest | jq .number; done  # equal
-ssh $SSH_USER@$NEW1 "systemctl show $SVC -p Restart; grep node_role $CFG"   # Restart=always, DbElected
-```
-
-### 11.3 Open 3 terminals to watch the cutover
-```bash
-# T1: leadership table
-watch -n0.5 "psql \"$PGURL\" -Atc 'SELECT node_id, last_updated, leader_acquired_at FROM sequencer_leader'"
-# T2: NEW1 logs
-ssh $SSH_USER@$NEW1 "journalctl -u $SVC -f" | grep -Ei 'leader|BatchProducer|heartbeat|error'
-# T3: write-path probe
-while true; do printf '%s ' "$(date +%T.%N | cut -c1-12)"; curl -s -o /dev/null -m 1 -w '%{http_code}\n' http://$WRITE_ENDPOINT/sequencer/ready; sleep 0.2; done
-```
-
-### 11.4 Cutover
-```bash
-# Stop old leader gracefully (SIGTERM; never kill -9) and prevent any restart (Restart=, Ansible, CI)
-ssh $SSH_USER@$OLD_LEADER "sudo systemctl disable --now $SVC && sudo systemctl mask $SVC && systemctl is-active $SVC"   # 'inactive'
-```
-What should happen within seconds:
-1. T1: `node_id` flips to `<env>-seq-v2-0`.
-2. T2: *"Replica acquired leadership! Exiting to restart as leader."* → systemd restart → *"DbElected node acquired leadership, running as BatchProducer"*.
-3. T3: a short run of non-200 responses, then 200 again.
-
-Move the write endpoint now **if** it's an EIP, DNS, or LB (§2.7 b/c/d):
-```bash
-# (b) Elastic IP
-aws ec2 associate-address --allocation-id <eipalloc-…> --instance-id $NEW1_ID --allow-reassociation
-# (c) Route53
-aws route53 change-resource-record-sets --hosted-zone-id <ZONE> --change-batch '{"Changes":[{"Action":"UPSERT","ResourceRecordSet":{"Name":"<write.fqdn>","Type":"A","TTL":30,"ResourceRecords":[{"Value":"'$NEW1'"}]}}]}'
-# (d) LB
-aws elbv2 deregister-targets --target-group-arn $TG_ARN --targets Id=$OLD_LEADER_ID,Port=$API
-```
-From now until §13, **never run the playbook against the old hosts** (always `--limit sequencers_v2`). A role that enforces `state: started` would try to bring the old leader back.
-
-### 11.5 Post-cutover verification
-```bash
-curl -s http://$NEW1:$API/sequencer/role | jq
-psql "$PGURL" -c "SELECT node_id, last_updated FROM sequencer_leader;"
-for i in 1 2; do for h in $NEW_NODES; do printf '%-16s ' $h; curl -s http://$h:$API/ledger/slots/latest | jq .number; done; sleep 15; done   # advancing, NEW2 follows
-ssh $SSH_USER@$NEW1 "journalctl -u $SVC --since '-5min' | grep -Ei 'blob|submit|batch' | tail -20"   # batches published to DA
-```
-Submit a test tx with your usual tool or script, then:
-```bash
-curl -s http://$WRITE_ENDPOINT/sequencer/txs/<tx_hash>/status | jq
+mkdoc() {  # $1 = document, $2 = old profile, $3 = new profile
+  aws --profile $RO ssm get-document --name $1 --document-version $DOC_BASE --document-format JSON --query Content --output text > /tmp/$1.v$DOC_BASE.json
+  old=$(printf '%s' "$2" | base64 -w0); new=$(printf '%s' "$3" | base64 -w0)
+  [ "$(grep -cF "'$old'" /tmp/$1.v$DOC_BASE.json)" = 1 ] || { echo "STOP: '$old' not found exactly once in $1"; return 1; }
+  sed "s|'$old'|'$new'|" /tmp/$1.v$DOC_BASE.json > /tmp/$1.new.json
+  diff <(jq . /tmp/$1.v$DOC_BASE.json) <(jq . /tmp/$1.new.json)      # exactly one line: the DISK_PROFILE line
+}
+mkdoc $P_DOC aws_raid_0 aws_single_nvme_ebs_logs
+mkdoc $S_DOC aws_raid_0 aws_single_nvme_ebs_logs
+mkdoc $B_DOC aws_ebs_backup_node_raid_0 aws_ebs_backup_node_single_nvme
 ```
 
 ---
 
-## 12. Make NEW2 a standby candidate
-In `inventories/<dev>/host_vars/<env>-sequencer-v2-1.yml` set `sequencer_node_role: DbElected`, then:
+## 4. Per-node procedure
+
+Run §4.1–§4.7 three times, finishing each node before starting the next:
+
+| Run | Node | Variables |
+|---|---|---|
+| 1 | the **non-leader** from §2.2 | `N=S ASG=$S_ASG LT=$S_LT LTV=$S_LTV DOC=$S_DOC OLD=$S_OLD` (or the `P_` set if the secondary leads) |
+| 2 | the **leader** | the other `P_` / `S_` set |
+| 3 | **backup** | `N=B ASG=$B_ASG LT=$B_LT LTV=$B_LTV DOC=$B_DOC OLD=$B_OLD` |
+
+### 4.1 Activate the new template and disk profile **[write]**
 ```bash
-ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit <env>-sequencer-v2-1 --check --diff
-ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit <env>-sequencer-v2-1
-ssh $SSH_USER@$NEW2 "journalctl -u $SVC --since '-2min' | grep -E 'did not acquire leadership'"   # restart by hand first if the role has no handler
+DOCV=$(aws --profile $RW ssm update-document --name $DOC --content file:///tmp/$DOC.new.json --document-format JSON \
+  --document-version '$LATEST' --query DocumentDescription.LatestVersion --output text); echo "${N}_DOCV=$DOCV" | tee -a $LOG
+aws --profile $RW ssm update-document-default-version --name $DOC --document-version $DOCV
+aws --profile $RW autoscaling update-auto-scaling-group --auto-scaling-group-name $ASG --launch-template LaunchTemplateId=$LT,Version=$LTV
+# check
+aws --profile $RO ssm get-document --name $DOC --document-format JSON --query Content --output text | grep -o "DISK_PROFILE=[^|]*"
+aws --profile $RO autoscaling describe-auto-scaling-groups --auto-scaling-group-names $ASG --query 'AutoScalingGroups[0].LaunchTemplate'
 ```
-Commit all inventory, host_vars, group_vars and role changes to the Ansible repo.
+
+### 4.2 Launch the new instance **[write]**
+```bash
+aws --profile $RW autoscaling set-desired-capacity --auto-scaling-group-name $ASG --desired-capacity 2
+watch -n15 "aws --profile $RO autoscaling describe-auto-scaling-groups --auto-scaling-group-names $ASG \
+  --query 'AutoScalingGroups[0].Instances[].[InstanceId,LifecycleState,HealthStatus,LaunchTemplate.Version]' --output text"
+NEW=<instance id whose LaunchTemplate.Version = $LTV>; echo "${N}_NEW=$NEW" | tee -a $LOG
+aws --profile $RW autoscaling set-instance-protection --auto-scaling-group-name $ASG --instance-ids $NEW --protected-from-scale-in
+aws --profile $RO ec2 describe-instances --instance-ids $NEW \
+  --query 'Reservations[0].Instances[0].{type:InstanceType,az:Placement.AvailabilityZone,ip:PrivateIpAddress,disks:BlockDeviceMappings[].DeviceName}'
+```
+- Expect `i8g.4xlarge`, the same AZ as the old node, and disks `/dev/sda1`, `/dev/sdg` (plus `/dev/sdf` for the backup).
+- If no instance appears, check `aws --profile $RO autoscaling describe-scaling-activities --auto-scaling-group-name $ASG --max-items 3`. `InsufficientInstanceCapacity` means AWS has no capacity right now: retry later. Primary and backup ASGs are pinned to us-east-1a, the secondary to us-east-1b.
+
+### 4.3 Watch the bootstrap and check the disk layout
+```bash
+aws --profile $RW ssm start-session --target $NEW
+sudo tail -f /var/log/user-data.log         # until "User data script completed"; ~30–90 min (Ansible compiles the rollup)
+```
+Then:
+```bash
+lsblk -o NAME,MODEL,SIZE,TYPE,MOUNTPOINTS
+cat /proc/mdstat                                   # no md device
+findmnt /mnt/rollup /mnt/logs /mnt/snapshots       # rollup = "Amazon EC2 NVMe Instance Storage" (ext4, ~3.4T),
+                                                   # logs = EBS /dev/sdg, snapshots = EBS /dev/sdf (backup only)
+nproc; free -g                                     # 16 / ~124
+grep -E '^(disk_profile|rollup_node_role|rollup_sequencer_kind|rollup_commit_hash|rollup_node_id)' /home/ubuntu/runtime_vars.yaml
+systemctl is-active rollup                         # active: syncing from the DA start height on an empty disk
+curl -s -o /dev/null -w 'ready=%{http_code}\n' localhost:12346/sequencer/ready   # not 200, so not routed by the proxy
+```
+If the bootstrap failed, the last Ansible task in the log explains why. The usual cause is *"Not enough instance store disks for RAID"*: the new `DISK_PROFILE` wasn't active, so redo §4.1. To discard the instance, remove its protection (`set-instance-protection --no-protected-from-scale-in`), then run `aws --profile $RW autoscaling terminate-instance-in-auto-scaling-group --instance-id $NEW --should-decrement-desired-capacity`.
+
+Primary and secondary nodes are `DbElected`. Until the restore is done, make sure the current leader stays up, because this node isn't caught up yet.
+
+### 4.4 Restore the latest backup snapshot onto the new node
+In the session on `$NEW`:
+```bash
+sudo -iu ubuntu
+tmux new -s restore
+SNAP=$(aws ec2 describe-snapshots --region us-east-1 --owner-ids self \
+  --filters Name=volume-id,Values=vol-0b7f605d6d0900a4a Name=tag:AutomatedBackup,Values=true Name=status,Values=completed \
+  --query 'sort_by(Snapshots,&StartTime)[-1].[SnapshotId,StartTime]' --output text); echo $SNAP
+SNAP=${SNAP%%[[:space:]]*}
+
+# primary / secondary:
+/home/ubuntu/restore-from-snapshot.sh $SNAP
+# backup: hold the snapshot lock so the hourly cron can't snapshot a half-restored disk
+flock -n /home/ubuntu/.rollup-snapshot.lock /home/ubuntu/restore-from-snapshot.sh $SNAP
+```
+Type `yes`. The script (from Ansible) runs these steps:
+1. Stops rollup.
+2. Creates a gp3 volume from the snapshot (80k IOPS, 2000 MB/s, initialization rate 300 MiB/s) and attaches it as `/dev/sdr`.
+3. Wipes `/mnt/rollup` and rsyncs `/rollup/` into it, then fixes ownership.
+4. Detaches and deletes the temporary volume, then starts rollup.
+
+Allow about 1–1.5 h for 944 GB. The log is in `/mnt/logs/rollup-restore.log`. The instance role already has the EBS permissions it needs.
+
+If it stops halfway, its exit trap detaches and deletes the temporary volume. Check for leftovers with `aws --profile $RO ec2 describe-volumes --filters Name=tag:Purpose,Values=restore-temp --query 'Volumes[].[VolumeId,State]'`, then re-run.
+
+The stack output `RestoreFromVolumeInstructions` points at `/tmp/restore-from-volume.sh`. That path is out of date: the script lives at `/home/ubuntu/restore-from-snapshot.sh`.
+
+### 4.5 Catch-up checks
+On `$NEW`:
+```bash
+curl -s localhost:12346/rollup/sync-status | jq -c
+curl -s localhost:12346/ledger/slots/latest | jq -c '{number,state_root}'     # starts near the snapshot height, not genesis, then rises
+curl -s -o /dev/null -w 'ready=%{http_code}\n' localhost:12346/sequencer/ready # 200 once caught up
+curl -s localhost:12346/sequencer/role; echo
+sudo journalctl -u rollup --since '-30min' | grep -Ei 'error|panic|mismatch' | tail
+```
+- **Same state root as the cluster:** pick a slot `N` slightly below the head and compare `curl -s localhost:12346/ledger/slots/$N | jq -r .state_root` on `$NEW` and on the leader. The values must be identical.
+- Once `ready=200`, node-discovery puts the node in read routing automatically.
+- **Soak:** at least 24 h for run 1, at least 2 h for runs 2 and 3. Watch `uptime; free -g; df -h /mnt/rollup /mnt/logs` and CloudWatch CPU:
+  ```bash
+  aws --profile $RO cloudwatch get-metric-statistics --namespace AWS/EC2 --metric-name CPUUtilization --dimensions Name=InstanceId,Value=$NEW \
+    --statistics Average Maximum --period 300 --start-time $(date -u -d '-6 hours' +%FT%TZ) --end-time $(date -u +%FT%TZ) \
+    --query 'sort_by(Datapoints,&Timestamp)[-12:].[Timestamp,Average,Maximum]' --output table
+  ```
+- Run 3 (backup) only: after the restore, the hourly cron writes to the new `/dev/sdf`. Wait for the first `=== Snapshot complete ===` in `/mnt/logs/rollup-snapshot.log`, then check the snapshot exists:
+  ```bash
+  aws --profile $RO ec2 describe-snapshots --owner-ids self --filters Name=tag:InstanceId,Values=$NEW --query 'Snapshots[].[SnapshotId,StartTime,State]'
+  ```
+
+### 4.6 Retire the old instance (in run 2 this is the leader failover)
+Run 2 only. Before you start, every preferred node that's running must return `ready=200` and be at the same height. Then open these watches:
+```bash
+# laptop: write-path probe through the proxy (/sequencer/ready is always routed to the leader)
+while true; do printf '%s ' "$(date +%T)"; curl -s -o /dev/null -m 2 -w '%{http_code}\n' https://$DOMAIN/sequencer/ready; sleep 0.5; done
+# sessions on both NEW preferred nodes
+sudo journalctl -u rollup -f | grep -Ei 'leader|BatchProducer'
+```
+For every run, remove the old instance from the ASG but keep it running as a rollback option. Then stop rollup on it:
+```bash
+aws --profile $RW autoscaling detach-instances --auto-scaling-group-name $ASG --instance-ids $OLD --should-decrement-desired-capacity
+echo "${N}_DETACHED=$OLD" | tee -a $LOG
+aws --profile $RW ssm start-session --target $OLD
+sudo systemctl disable --now rollup && sudo systemctl mask rollup; systemctl is-active rollup      # inactive
+# run 3 (backup) only: stop the old node's snapshot cron
+sudo crontab -u ubuntu -l | grep -v snapshot-rollup-data.sh | sudo crontab -u ubuntu -
+```
+- Run 2: within seconds, one of the new `DbElected` nodes logs *"Replica acquired leadership! Exiting to restart as leader."*. systemd restarts it, and it logs *"DbElected node acquired leadership, running as BatchProducer"*. The probe shows a short run of non-200 responses, then 200. Either new node may win.
+- Then put the new instance back under normal ASG rules:
+  ```bash
+  aws --profile $RW autoscaling set-instance-protection --auto-scaling-group-name $ASG --instance-ids $NEW --no-protected-from-scale-in
+  ```
+- Post-check: `curl -s https://$DOMAIN/ledger/slots/latest | jq .number` keeps rising. Send a test transaction with your usual tool and confirm it's accepted.
+
+### 4.7 Terminate the old instance (after the soak) **[write]**
+```bash
+aws --profile $RO ec2 describe-instances --instance-ids $OLD \
+  --query 'Reservations[0].Instances[0].{type:InstanceType,asg:Tags[?Key==`aws:autoscaling:groupName`]|[0].Value,state:State.Name}'   # c8gd.12xlarge, the old one
+aws --profile $RW ec2 terminate-instances --instance-ids $OLD --dry-run
+aws --profile $RW ec2 terminate-instances --instance-ids $OLD
+echo "${N}_TERMINATED=$OLD" | tee -a $LOG
+```
+Instance store and root volume go with it, along with `/dev/sdf` on the backup (`DeleteOnTermination=true`). Check for orphaned volumes using the stack's own command:
+```bash
+aws --profile $RO ec2 describe-volumes --filters "Name=tag:Stack,Values=SovRollupCdkStarterStack" "Name=status,Values=available" --query 'Volumes[].[VolumeId,Size,CreateTime]' --output table
+```
+**Before terminating the old backup node (run 3),** set `SNAP_VOL` to the new backup's `/dev/sdf` volume for any future restore: `aws --profile $RO ec2 describe-volumes --filters Name=attachment.instance-id,Values=$NEW Name=attachment.device,Values=/dev/sdf --query 'Volumes[0].VolumeId' --output text`.
 
 ---
 
-## 13. Soak (24–48 h), then decommission
-
-During the soak, **leave the old instances running with the service masked**. Stopping them wipes the instance store and makes a quick rollback impossible.
-
-After the soak (all AWS commands are run by a human):
-
-1. **Confirm exactly which instances you're about to delete.** They must be the 12xlarge ones, and none of the v2 IDs may be in the list:
-   ```bash
-   source $LOG
-   aws ec2 describe-instances --instance-ids $OLD_IDS \
-     --query 'Reservations[].Instances[].{id:InstanceId,name:Tags[?Key==`Name`]|[0].Value,type:InstanceType,ip:PrivateIpAddress,state:State.Name}' --output table
-   for id in $OLD_IDS; do [ "$id" = "$NEW1_ID" ] || [ "$id" = "$NEW2_ID" ] && echo "STOP: $id is a v2 instance"; done
-   ```
-2. **List what's attached to them**, so nothing is orphaned or left billing:
-   ```bash
-   aws ec2 describe-addresses --filters Name=instance-id,Values=${OLD_IDS// /,} --query 'Addresses[].{ip:PublicIp,alloc:AllocationId,inst:InstanceId}'
-   aws ec2 describe-volumes --filters Name=attachment.instance-id,Values=${OLD_IDS// /,} \
-     --query 'Volumes[].{id:VolumeId,inst:Attachments[0].InstanceId,delOnTerm:Attachments[0].DeleteOnTermination}' --output table
-   aws elbv2 describe-target-health --target-group-arn $TG_ARN --query 'TargetHealthDescriptions[].Target.Id'   # old ids must be gone (§11)
-   ```
-3. **Remove termination protection, then terminate** (try `--dry-run` first):
-   ```bash
-   for id in $OLD_IDS; do aws ec2 modify-instance-attribute --instance-id $id --no-disable-api-termination; done
-   aws ec2 terminate-instances --instance-ids $OLD_IDS --dry-run
-   aws ec2 terminate-instances --instance-ids $OLD_IDS
-   aws ec2 wait instance-terminated --instance-ids $OLD_IDS
-   echo "TERMINATED $OLD_IDS $(date -u +%FT%TZ)" >> $LOG
-   ```
-4. **Clean up the leftovers found in step 2:**
-   ```bash
-   aws ec2 release-address --allocation-id <eipalloc-… of the old hosts, only if NOT moved to NEW1 in §11.4>
-   aws ec2 delete-volume --volume-id <vol-… that had DeleteOnTermination=false>
-   aws ec2 revoke-security-group-ingress --group-id <sg> --ip-permissions "IpProtocol=tcp,FromPort=<port>,ToPort=<port>,IpRanges=[{CidrIp=<old ip>/32}]"   # old-IP rules only
-   aws iam delete-role-policy --role-name $ROLE --policy-name $ENV-sequencer-snapshot-read                                                         # §3.4
-   ```
-5. Clean up the rest:
-   - Ansible: remove the old hosts from the inventory, merge `group_vars/sequencers_v2.yml` into the parent group, drop the `sequencers_v2` group, and remove the old fixed-3-disk RAID code. Re-run `ansible-playbook … --check --diff` on the whole group: it must show no changes.
-   - Keep `$LOG` (instance IDs, SG rules, IAM policy, TG targets). Later, the Terraform codebase imports these resources from it instead of recreating them.
-   - Prometheus scrape targets and file_sd, Grafana dashboards, alert rules that name hosts or instance IDs. Check with `promtool check config <prometheus.yml>` and `promtool check rules <rules.yml>`.
-   - **Disk alerts:** the same % threshold now gives ⅓ of the absolute headroom. Re-tune thresholds and `for:`, or alert on `predict_linear(...[6h], 3*86400) < 0`.
-   - SSH `known_hosts`, docs, and runbooks that mention old IPs.
-6. Re-enable automatic deploys to dev, pointed at the new hosts.
+## 5. Finish
+```bash
+for g in $P_ASG $S_ASG $B_ASG; do aws --profile $RW autoscaling resume-processes --auto-scaling-group-name $g --scaling-processes ReplaceUnhealthy AZRebalance; done
+aws --profile $RO autoscaling describe-auto-scaling-groups --auto-scaling-group-names $P_ASG $S_ASG $B_ASG \
+  --query 'AutoScalingGroups[].{asg:AutoScalingGroupName,desired:DesiredCapacity,ltv:LaunchTemplate.Version,inst:Instances[].[InstanceId,LifecycleState,ProtectedFromScaleIn]}'
+aws --profile $RO ec2 describe-instances --filters Name=tag:Stack,Values=SovRollupCdkStarterStack Name=instance-state-name,Values=running \
+  --query 'Reservations[].Instances[].[InstanceId,InstanceType,PrivateIpAddress,Tags[?Key==`ASGType`]|[0].Value]' --output table
+```
+- **Proxy static fallback:** `backend-select.lua` has the leader/follower IPs baked in at render time. They're used only before node-discovery's first update. On the proxy, run `sudo grep -rnE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:12346' /etc/openresty /usr/local/openresty 2>/dev/null`. If it still shows `10.0.2.21` / `10.0.3.143`, refresh the proxy config the way the proxy is normally re-rendered.
+- **Alarms:** check that `SovRollupCdkStarterStack-health-check-failure` and `SovRollupCdkStarterStack-runtime-config-drift` are back to OK.
+- **Old snapshots:** once the old backup is terminated, its snapshots on `vol-0b7f605d6d0900a4a` are no longer pruned. The same applies to the September snapshots of `vol-03be4d7901208fbe7` already in the account. Delete them when you no longer need them: `aws ec2 delete-snapshot --snapshot-id …`.
+- Keep `$LOG`.
 
 ---
 
-## 14. Rollback
+## 6. Rollback
 
 | When | Action |
 |---|---|
-| Before §11.4 | Stop and mask the service on the new nodes and deregister them from the LB (`aws elbv2 deregister-targets … Id=$NEW1_ID … Id=$NEW2_ID`). Then remove them: `aws ec2 modify-instance-attribute --instance-id <id> --no-disable-api-termination` for each, followed by `aws ec2 terminate-instances --instance-ids $NEW1_ID $NEW2_ID`. Revert the §3.3/§3.4 additions listed in `$LOG` and remove `sequencers_v2` from the Ansible inventory. Old cluster untouched. |
-| After §11.4, new leader healthy but you want to go back | On OLD_LEADER: set `node_role = "DbElected"` (**not** `Leader`), `sudo systemctl unmask $SVC && sudo systemctl enable --now $SVC`, wait until it's at head (§8.1). Make sure it has `Restart=always` (§2.8). Then `sudo systemctl disable --now $SVC && sudo systemctl mask $SVC` on NEW2 and then NEW1. The old node takes over within ~1 s. Move the EIP/DNS back. |
-| After §11.4, new leader crash-looping (OOM, disk, …) | 1) `sudo systemctl disable --now $SVC && sudo systemctl mask $SVC` on NEW1 **and** NEW2 (stops it from re-acquiring leadership on every restart). 2) On OLD_LEADER: set `DbElected`, unmask, `enable --now`. It acquires leadership after ~1 s, exits, and restarts as leader. 3) Move the EIP/DNS back. 4) Diagnose with `journalctl -u $SVC`, `journalctl -k \| grep -i oom`, `df -h`. |
+| Before §4.6 for a node | Remove the new instance: `set-instance-protection --no-protected-from-scale-in`, then `terminate-instance-in-auto-scaling-group --instance-id $NEW --should-decrement-desired-capacity`. Point the ASG back to v44: `update-auto-scaling-group --launch-template LaunchTemplateId=$LT,Version=$LT_BASE`. Restore the document: `update-document-default-version --name $DOC --document-version $DOC_BASE`. The old node was never touched. |
+| After §4.6, before §4.7 | On `$OLD`: `sudo systemctl unmask rollup && sudo systemctl enable --now rollup`. It rejoins as a `DbElected` replica; wait for `ready=200`. Re-attach it: `aws autoscaling attach-instances --auto-scaling-group-name $ASG --instance-ids $OLD` (max size allows 2). Then handle the new instance as in the first row. For the backup, also restore the old cron line: `0 * * * * /home/ubuntu/snapshot-rollup-data.sh` in `crontab -u ubuntu`. |
+| New leader crash-looping after run 2 | In sessions on both new preferred nodes: `sudo systemctl disable --now rollup && sudo systemctl mask rollup`. Then on the old leader: `sudo systemctl unmask rollup && sudo systemctl enable --now rollup`. It's `DbElected` and takes leadership about 1 s after the others stop heartbeating. Diagnose with `journalctl -u rollup`, `journalctl -k \| grep -i oom`, `df -h`. |
 
 ---
 
-## 15. Troubleshooting
-
-- **Log says "Leadership lost! Another node has taken over."**: a second leader-capable node started. Find it with `SELECT * FROM nodes`, then mask it.
-- **New node never reaches head:** check DA reachability, Postgres reachability, and IO saturation (`iostat -xm 5`). If disk-bound, the 4xlarge is too small (go to 8xlarge).
-- **NEW1 doesn't take over after the old leader stops:** it isn't `DbElected`, its `Restart=` isn't `always`, or the old leader is still heartbeating (check it's really inactive and that nothing else uses its `node_id`).
-- **Address in `nodes` is wrong or unreachable:** fix the bind host or port in the config. The proxy routes using that address.
+## 7. Port the changes to the CDK code (before the next `cdk deploy`)
+- `PrimaryLaunchTemplate`, `SecondaryLaunchTemplate`, `BackupNodeLaunchTemplate`: `instanceType` → `i8g.4xlarge`. Add the `/dev/sdg` gp3 logs volume (`LOGS_GB`, encrypted, delete on termination). Keep `/dev/sdf` on the backup.
+- Runtime config values: `DISK_PROFILE` = `aws_single_nvme_ebs_logs` for primary and secondary, `aws_ebs_backup_node_single_nvme` for backup.
+- Fix the `RestoreFromVolumeInstructions` output (`/home/ubuntu/restore-from-snapshot.sh <snap-id>`).
+- `cdk diff` should show only these changes: 3 launch templates, 3 ASG `LaunchTemplate.Version` values, 3 SSM documents. It must not show any instance replacement.
 
 ---
 
-## 16. Order of work and time estimate (per environment)
+## 8. Time estimate
 
 | Step | Duration |
 |---|---|
-| §2 pre-flight (incl. §2.11 snapshot checks) | 1.5 h |
-| §3–§6 AWS CLI launch, Ansible, verify | 2–4 h |
-| §7 snapshot restore (both hosts in parallel) | ~1–2 h per 3 TB (S3 stream); slower for EBS lazy-load |
-| §8.0 catch-up from snapshot height | minutes to a few hours |
-| §8 sync + soak | ≥ 24 h |
-| §9–§12 routing + cutover | 1 h (write pause: seconds) |
-| §13 soak + decommission | 24–48 h, then 1 h |
-
-Repeat §1–§13 for each dev environment, one at a time.
+| §2 pre-flight + §3 preparation | 1 h |
+| Per node: bootstrap (§4.3) | 30–90 min |
+| Per node: snapshot restore (§4.4) | 1–1.5 h |
+| Per node: catch-up + soak (§4.5) | 24 h (run 1), ≥ 2 h (runs 2, 3) |
+| Leader failover (§4.6, run 2) | seconds of write pause |
+| §4.7 terminations + §5 | 1 h |
 
 ## Definition of done
-- Every dev env runs only i8g.4xlarge sequencers. The single NVMe is mounted at the original mount point by UUID with `nofail`, and there's no md device.
-- `sequencer_leader` holds a v2 node. All v2 nodes are `DbElected`, registered in `nodes`, at head, with matching state roots. Tx submission, soft confirmations, and DA batch publishing work.
-- The only client-visible impact was the seconds-long write pause at cutover.
-- The Ansible repo contains the new hosts in the inventory, the device-count-aware disk provisioning, the restart policy, and the tuned config. The old hosts are gone from the inventory.
-- The old instances are terminated, with no orphaned EIPs, volumes, SG rules or IAM policies. `$LOG` lists every AWS resource created by hand, ready for a later Terraform import. Monitoring and alerts are updated.
-- After 48 h: RSS < 75% of RAM, disk < 80% used, no OOM or unexpected restarts.
+- The Primary, Secondary and BackupNode ASGs each run exactly one **i8g.4xlarge** instance from the new launch template version. Scale-in protection is removed and the suspended processes are resumed.
+- On each node, `/mnt/rollup` is on the single instance-store NVMe (no md device) and `/mnt/logs` is on EBS `/dev/sdg`. The backup also has `/mnt/snapshots` on EBS `/dev/sdf`, and new hourly snapshots of its new volume complete.
+- One new preferred node is leader. Both preferred nodes return `ready=200`, have the same height and the same state roots. `https://relay-devnet.sovereign-labs.xyz` serves reads and writes. The only client-visible impact was the leader failover pause.
+- The old c8gd.12xlarge instances are terminated, with no orphaned volumes, and the alarms are OK.
+- The CDK code has been updated (§7), so the next `cdk deploy` doesn't revert the change.
