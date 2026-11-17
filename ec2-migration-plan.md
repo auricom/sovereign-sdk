@@ -1,14 +1,14 @@
 # Runbook: migrate dev sequencers from i8g.12xlarge to i8g.4xlarge with no downtime
 
 > Nothing in this runbook has been executed. All commands are meant to be run by a human, in order, one environment at a time.
-> The Terraform/Ansible code for the dev servers is **not** in `sovereign-sdk` and I couldn't find it locally. Infra snippets are templates: adapt resource names and paths to your infra repo.
+> The Terraform/Ansible code for the dev servers is **not** in `sovereign-sdk`. Infra snippets are templates: adapt resource names and paths to your infra repo.
 > Everything about sequencer behaviour (roles, leader election, endpoints) comes from the SDK source in this repo.
 
 ---
 
 ## 0. Background (read once)
 
-### 0.1 Hardware change (confirm in step 1.6)
+### 0.1 Hardware change (confirm in §2.9)
 
 | | i8g.12xlarge | i8g.4xlarge |
 |---|---|---|
@@ -28,7 +28,7 @@
 
 ### 0.3 Strategy
 1. Add new 4xlarge hosts next to the old ones (never modify the old ones in place).
-2. Seed the new hosts' data by copying from a stopped old **replica**, or sync them from DA.
+2. Seed the new hosts' data by **restoring the latest snapshot taken by the backup node** (§7). The new nodes then only replay the few DA blocks since the snapshot. No old node is stopped during seeding.
 3. Run the new hosts as `Replica` until they're at head, and soak them.
 4. Set one new node to `DbElected`, stop and mask the old leader, and the new node takes over.
 5. Soak, then destroy the old hosts.
@@ -51,10 +51,12 @@ export PGURL='postgresql://<user>:<pass>@<host>:5432/<db>'
 export SSH_USER=<ssh user>
 export OLD_LEADER=<private ip>
 export OLD_REPLICAS="<ip> <ip>"          # may be empty
-export NEW1=<ip>                         # filled after step 4; this one becomes the leader
+export NEW1=<ip>                         # filled after §3.3; this one becomes the leader
 export NEW2=<ip>                         # standby
 export NEW_NODES="$NEW1 $NEW2"
 export WRITE_ENDPOINT=<host:port clients use to submit txs>
+export BACKUP_NODE=<ip of the backup node that takes snapshots>
+export SNAP_URI=<s3://bucket/prefix where snapshots land, e.g. s3://<bucket>/<env>/>   # S3 variant (§7.A)
 ```
 
 Find the values on an old host:
@@ -116,7 +118,7 @@ uptime; nproc
 mpstat 5 6                                       # sysstat package
 iostat -xm 5 6 /dev/md0 /dev/nvme*n1             # r/s, w/s, rMB/s, wMB/s, %util at peak
 ```
-Write down peak `r/s + w/s` and MB/s on `md0`. You'll compare them to the fio result on the new host (§6.4). **Go if** the peak is < 50% of what a single new drive can do.
+Write down peak `r/s + w/s` and MB/s on `md0`. You'll compare them to the fio result on the new host (§6.2). **Go if** the peak is < 50% of what a single new drive can do.
 
 ### 2.6 Cluster topology and Postgres
 ```bash
@@ -125,14 +127,14 @@ psql "$PGURL" -c "SELECT node_id, address, now()-last_updated AS age FROM nodes 
 psql "$PGURL" -c "SHOW max_connections;" -c "SELECT count(*) FROM pg_stat_activity;"
 ```
 Write down the leader's `node_id` and IP, every replica, and each node's `node_role` (in `$CFG`).
-**Go if** there's ≥ 1 old **replica** (needed for the fast data copy in §7). If there's none, use §7-A (sync from DA).
+Seeding uses the backup node's snapshot (§2.11, §7), so having no old replica is fine. Old replicas only serve as a fallback data source (§7.D).
 
 ### 2.7 How clients reach the cluster
 Find out how **writes** reach the leader today and write it down. Pick one:
 - (a) proxy using `sov-proxy-utils` node discovery (follows `sequencer_leader` automatically): nothing to do at cutover
 - (b) Elastic IP on the leader: reassociate at cutover (§11.4)
 - (c) DNS record pointing at the leader: **lower TTL to 30 s at least 24 h before cutover** and update it at cutover (§11.4)
-- (d) LB target group: register/deregister (§9, §10, §11)
+- (d) LB target group: register/deregister (§9, §11)
 
 Also check who else talks to a specific host directly (prover, indexer, explorer, relayer, monitoring) and plan to repoint them.
 
@@ -156,6 +158,51 @@ aws service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A 
 ### 2.10 Freeze
 - Pause automatic deploys to dev (CI/CD, Ansible cron, Renovate auto-deploys) for the whole migration. An automated redeploy could restart an old node as `Leader` after cutover.
 - Tell dev users which window the ~seconds-long write pause will happen in.
+
+### 2.11 Backup node snapshots (read-only), go/no-go
+The SDK has no built-in snapshot command, so snapshots are whatever the backup node's job produces. First find out exactly what that job does:
+
+```bash
+ssh $SSH_USER@$BACKUP_NODE
+systemctl list-timers --all | grep -Ei 'snap|backup'
+sudo crontab -l; ls /etc/cron.d/; grep -rlEi 'snap|backup' /etc/cron.d /etc/systemd/system 2>/dev/null
+systemctl cat <snapshot unit>                      # find the script it runs
+sudo cat <snapshot script>                         # read it end to end
+grep -nE '^\[|path|_db_path|hashtable_buckets|preallocate_ht' <backup node config toml>
+<rollup binary> --version                          # version that writes the snapshots
+```
+
+From the script, write down:
+
+| Question | Why it matters |
+|---|---|
+| **Format and location**: tar(.zst/.gz/.lz4) archive in S3 (→ §7.A), EBS snapshot of a data volume (→ §7.B), or a directory/archive on the backup node's own disk (→ §7.C) | Decides which restore procedure to use |
+| **Consistency**: is the rollup service **stopped** (or are NOMT and RocksDB checkpointed) while the snapshot is taken? | A copy of live NOMT/RocksDB files can't be opened. If the script copies files from a running node, don't use it: fix the script or use §7.D |
+| **Contents**: which dirs are inside (`state-db`, `ledger`, `user_nomt_db`, … per `[storage]` paths) and the archive's top-level path | Must match the sequencer's `[storage]` layout. Decides `--strip-components` |
+| **Height**: rollup slot / DA height at snapshot time (manifest file, object tags, or log line) | Used to check the state root after restore and to estimate catch-up time |
+| **Checksum**: is a `.sha256` written next to the archive? | Integrity check after download |
+| **Frequency and retention** | Pick a snapshot that's < 24 h old |
+
+Then check a candidate snapshot (S3 example; adjust for EBS: `aws ec2 describe-snapshots --owner-ids self --filters Name=tag:Name,Values=<pattern> --query 'reverse(sort_by(Snapshots,&StartTime))[:5].[SnapshotId,StartTime,VolumeSize,State]' --output table`):
+
+```bash
+aws s3 ls $SNAP_URI --human-readable | sort | tail -5
+export SNAP_OBJ=${SNAP_URI%/}/<latest-archive-name>          # e.g. .../rollup-20261117T0300Z.tar.zst
+aws s3api head-object --bucket <bucket> --key <prefix/latest-archive-name> \
+  --query '{size:ContentLength,modified:LastModified,meta:Metadata}'
+aws s3 cp ${SNAP_OBJ}.sha256 - 2>/dev/null                    # if the job writes one
+aws s3 cp ${SNAP_URI%/}/<manifest file> - 2>/dev/null         # if the job writes one (height, version, …)
+# List the archive's top-level layout without downloading it all (stops after 50 entries)
+aws s3 cp $SNAP_OBJ - | zstd -dc | tar -tf - | head -50
+```
+
+**Go if all are true:**
+- The snapshot was taken from a **cleanly stopped** node (or a proper DB checkpoint).
+- It was written by the **same rollup version** as the running cluster (§1 `systemctl cat`, `<binary> --version` on `$OLD_LEADER`). Never restore a snapshot from a newer version than the binary you'll run.
+- The backup node's `*_hashtable_buckets` / `*_preallocate_ht` equal the sequencers' (§2.3). Buckets can't be changed after creation.
+- Its **uncompressed** size is ≤ 3.0 TB. Check the manifest or `du` on the backup node.
+- It's < 24 h old and its DA height is still served by the DA node (pruning window).
+- It contains every dir the sequencer's `[storage]` config expects (compare with `sudo ls -la $ROLLUP_DIR` on an old sequencer from §2.2). If a sequencer has dirs the snapshot lacks (e.g. the backup node is a plain full node), don't guess: confirm with the SDK team that starting with those dirs missing is safe, or use §7.D.
 
 ---
 
@@ -184,6 +231,28 @@ resource "aws_instance" "sequencer_v2" {
 **User-data trap:** if you edit a user_data template that the **old** instances also use, Terraform plans an in-place `user_data` update. The AWS provider applies that by **stopping and starting** the instance, which **wipes the RAID**. So use a new template file (as above), or add `lifecycle { ignore_changes = [user_data] }` to the old resource.
 
 If the sequencers are in an ASG or launch template, don't use instance refresh. Create the v2 instances as standalone resources as above.
+
+**Snapshot read access** (needed for §7.A; skip for §7.B/§7.C). Add a read-only policy as a *new* resource on the role behind the instance profile, so the plan shows an add, not a change:
+
+```hcl
+resource "aws_iam_role_policy" "sequencer_snapshot_read" {
+  name = "<env>-sequencer-snapshot-read"
+  role = <role name behind the sequencer instance profile>
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      { Effect = "Allow", Action = ["s3:ListBucket"], Resource = "arn:aws:s3:::<bucket>",
+        Condition = { StringLike = { "s3:prefix" = ["<prefix>/*"] } } },
+      { Effect = "Allow", Action = ["s3:GetObject"], Resource = "arn:aws:s3:::<bucket>/<prefix>/*" },
+      # only if the bucket uses SSE-KMS:
+      { Effect = "Allow", Action = ["kms:Decrypt"], Resource = "<kms key arn>" },
+    ]
+  })
+}
+```
+For §7.B (EBS snapshot) the operator's credentials need `ec2:CreateVolume`, `ec2:AttachVolume`, `ec2:DetachVolume`, `ec2:DeleteVolume` and `ec2:CreateTags`. The instance doesn't need them.
+
+The v2 subnet must reach S3 (VPC S3 gateway endpoint or NAT). Without a gateway endpoint, multi-TB downloads go through the NAT and you pay NAT data-processing charges.
 
 ### 3.2 Validate and plan (safe)
 ```bash
@@ -383,44 +452,166 @@ sudo rm -f $DATA/fio.test
 
 ---
 
-## 7. Seed data on the new hosts
+## 7. Seed data on the new hosts from the backup node's snapshot
 
-### 7-B (recommended): copy from a stopped old replica
-Pick `SRC=<one of OLD_REPLICAS>`. Only this replica goes offline during the copy; the leader and other replicas keep serving. Copy time is about data size ÷ ~0.5–1 GB/s.
+Both new hosts restore **the same** snapshot, **in parallel** and independently of each other. The service stays stopped (§5.2) until §8. No old node is touched. Use the subsection that matches the format you found in §2.11:
+
+- §7.A: archive in S3 (most common for instance-store hosts)
+- §7.B: EBS snapshot
+- §7.C: archive or directory kept on the backup node itself
+- §7.D / §7.E: fallbacks if no usable snapshot exists
+
+### 7.0 Prepare each new host (all variants)
+```bash
+ssh $SSH_USER@$NEW1                            # then the same on NEW2
+systemctl is-active $SVC                       # must print 'inactive'
+sudo apt-get install -y zstd pv jq tmux        # or dnf; use pigz / lz4 instead of zstd if the archive uses them
+aws --version && aws sts get-caller-identity   # §7.A only: instance profile from §3.1 works
+sudo mkdir -p $ROLLUP_DIR
+sudo ls -A $ROLLUP_DIR                         # must print nothing (empty dir)
+df -h $DATA                                    # free ≥ uncompressed snapshot size + 20%
+```
+
+Pin the snapshot chosen in §2.11 (same values on both hosts):
+```bash
+export SNAP_OBJ=<exact s3://… URI of the archive>          # §7.A
+export SNAP_ID=<snap-… id>                                 # §7.B
+export SNAP_SLOT=<rollup slot recorded for this snapshot>  # from the manifest/log; used in §8
+export STRIP=<n>     # --strip-components: number of leading path parts in the archive above the data dirs
+                     # e.g. entries "rollup/state-db/…" → 1 ; entries "state-db/…" → 0
+```
+
+### 7.A Snapshot is an archive in S3
+
+Stream download → checksum → decompress → extract in **one pipeline**. Don't download the archive to disk first: the archive plus the extracted data won't both fit on the single 3.75 TB drive.
+
+```bash
+# 1) Faster S3 transfers (written to ~/.aws/config of the current user)
+aws configure set default.s3.max_concurrent_requests 64
+aws configure set default.s3.multipart_chunksize 256MB
+
+# 2) Restore inside tmux so an SSH drop doesn't kill it (≈1–2 h per 3 TB)
+tmux new -s restore
+BUCKET=$(echo "$SNAP_OBJ" | cut -d/ -f3); KEY=$(echo "$SNAP_OBJ" | cut -d/ -f4-)
+SIZE=$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" --query ContentLength --output text)
+aws s3 cp "$SNAP_OBJ" - \
+  | pv -s "$SIZE" \
+  | tee >(sha256sum > /tmp/snapshot.sha256) \
+  | zstd -dc -T0 \
+  | sudo tar -xf - -C "$ROLLUP_DIR" --strip-components="$STRIP" --numeric-owner
+echo "exit codes: ${PIPESTATUS[*]}"          # every value must be 0, else wipe $ROLLUP_DIR and retry
+
+# 3) Integrity (if the backup job publishes a checksum)
+sleep 5; cut -d' ' -f1 /tmp/snapshot.sha256
+aws s3 cp "${SNAP_OBJ}.sha256" - | cut -d' ' -f1         # must be identical
+```
+For other formats, replace `zstd -dc -T0`: `.tar.gz` → `pigz -dc`, `.tar.lz4` → `lz4 -dc`, plain `.tar` → remove that stage. zstd also checks its own frame checksums, so a non-zero exit code means the archive is corrupt.
+
+Retry after a failure:
+```bash
+sudo find "$ROLLUP_DIR" -mindepth 1 -delete      # wipe the partial extract, then re-run step 2
+```
+
+### 7.B Snapshot is an EBS snapshot
+
+Create a temporary volume from the snapshot in the new host's AZ, attach it, copy the data onto the NVMe, then delete the volume. Do this for NEW1 and NEW2 (one volume each, in parallel).
+
+From an operator machine:
+```bash
+export NEW_ID=<instance id of NEW1 (then NEW2)>
+AZ=$(aws ec2 describe-instances --instance-ids $NEW_ID --query 'Reservations[0].Instances[0].Placement.AvailabilityZone' --output text)
+VOL=$(aws ec2 create-volume --snapshot-id $SNAP_ID --availability-zone $AZ \
+  --volume-type gp3 --iops 16000 --throughput 1000 \
+  --tag-specifications "ResourceType=volume,Tags=[{Key=Name,Value=$ENV-seq-v2-restore-tmp}]" \
+  --query VolumeId --output text); echo $VOL
+aws ec2 wait volume-available --volume-ids $VOL
+aws ec2 attach-volume --volume-id $VOL --instance-id $NEW_ID --device /dev/sdf
+aws ec2 wait volume-in-use --volume-ids $VOL
+```
+
+On the new host:
+```bash
+export VOL=<vol-… from above>
+DEV=$(readlink -f /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${VOL/-/})
+lsblk -f $DEV                                   # check partitions / fs type / md member
+sudo mkdir -p /mnt/snap
+sudo mount -o nouuid $DEV /mnt/snap             # xfs; for ext4 drop -o nouuid. Mounted rw so the journal can replay; the volume is thrown away after.
+                                                # partitioned → mount ${DEV}p1 ; md member(s) → sudo mdadm --assemble --run /dev/md9 <devs> then mount /dev/md9
+sudo ls -la /mnt/snap                           # locate the rollup data dir
+export SNAP_SRC=/mnt/snap/<path to rollup data dir>
+tmux new -s restore
+sudo rsync -aH --numeric-ids --info=progress2 $SNAP_SRC/ $ROLLUP_DIR/
+sudo umount /mnt/snap
+```
+Volumes created from snapshots load lazily from S3, so the copy is slower than the gp3 figures (expect ~200–500 MB/s). Fast Snapshot Restore on `$SNAP_ID` in that AZ removes the lazy loading but is billed per hour. Optional.
+
+Clean up from the operator machine:
+```bash
+aws ec2 detach-volume --volume-id $VOL && aws ec2 wait volume-available --volume-ids $VOL
+aws ec2 delete-volume --volume-id $VOL
+aws ec2 describe-volumes --filters "Name=tag:Name,Values=$ENV-seq-v2-restore-tmp" --query 'Volumes[].VolumeId'   # must be empty
+```
+
+### 7.C Snapshot kept on the backup node's own disk
+
+Pull it straight from the backup node. That node keeps running: you read a **finished** snapshot, never its live data dir. First pause the snapshot job so it doesn't rotate or delete the file mid-copy:
+```bash
+ssh $SSH_USER@$BACKUP_NODE "sudo systemctl stop <snapshot>.timer"     # or comment out the cron entry
+```
+On each new host:
+```bash
+ssh -A $SSH_USER@$NEW1
+tmux new -s restore
+# archive file:
+ssh $SSH_USER@$BACKUP_NODE "sudo cat <path/to/snapshot archive>" \
+  | pv | tee >(sha256sum > /tmp/snapshot.sha256) | zstd -dc -T0 \
+  | sudo tar -xf - -C "$ROLLUP_DIR" --strip-components="$STRIP" --numeric-owner
+echo "exit codes: ${PIPESTATUS[*]}"
+# …or a snapshot directory:
+sudo --preserve-env=SSH_AUTH_SOCK rsync -aH --numeric-ids --info=progress2 \
+  --rsync-path="sudo rsync" -e "ssh -o Compression=no" \
+  $SSH_USER@$BACKUP_NODE:<snapshot dir>/ $ROLLUP_DIR/
+```
+When both hosts are done:
+```bash
+ssh $SSH_USER@$BACKUP_NODE "sudo systemctl start <snapshot>.timer"
+```
+
+### 7.D Fallback: copy from a stopped old replica
+Use this only if no snapshot passes §2.11. Pick `SRC=<one of OLD_REPLICAS>`. Only this replica goes offline during the copy.
 
 ```bash
 export SRC=<old replica ip>
-
-# 1) On SRC: take the replica out of read routing (LB, §9 commands), then stop it gracefully
-ssh $SSH_USER@$SRC "sudo systemctl stop $SVC && systemctl is-active $SVC || true"   # must print 'inactive'
-
-# 2) On NEW1: prepare target dir and copy (agent forwarding so sudo rsync can reach SRC)
+# 1) Take SRC out of read routing (§9 commands), then stop it gracefully
+ssh $SSH_USER@$SRC "sudo systemctl stop $SVC; systemctl is-active $SVC"      # must print 'inactive'
+# 2) On NEW1: copy
 ssh -A $SSH_USER@$NEW1
-sudo mkdir -p $ROLLUP_DIR
 sudo --preserve-env=SSH_AUTH_SOCK rsync -aH --numeric-ids --delete --info=progress2 \
   --rsync-path="sudo rsync" -e "ssh -o Compression=no -o StrictHostKeyChecking=accept-new" \
   $SSH_USER@$SRC:$ROLLUP_DIR/ $ROLLUP_DIR/
-sudo chown -R $SVC_USER: $ROLLUP_DIR
-
-# 3) Integrity: sizes must match exactly
-ssh $SSH_USER@$SRC "sudo du -sb $ROLLUP_DIR"
-sudo du -sb $ROLLUP_DIR
-
-# 4) Back on SRC: restart the old replica and re-add it to routing
+# 3) Sizes must match exactly
+ssh $SSH_USER@$SRC "sudo du -sb $ROLLUP_DIR"; sudo du -sb $ROLLUP_DIR
+# 4) Restart SRC and put it back in routing
 ssh $SSH_USER@$SRC "sudo systemctl start $SVC"
-
-# 5) NEW1 → NEW2 (NEW1 still NOT started, so its copy is consistent; no old node is affected)
+# 5) NEW1 → NEW2 (NEW1 not started yet, so its copy is consistent)
 ssh -A $SSH_USER@$NEW2
-sudo mkdir -p $ROLLUP_DIR
 sudo --preserve-env=SSH_AUTH_SOCK rsync -aH --numeric-ids --delete --info=progress2 \
   --rsync-path="sudo rsync" -e "ssh -o Compression=no" \
   $SSH_USER@$NEW1:$ROLLUP_DIR/ $ROLLUP_DIR/
-sudo chown -R $SVC_USER: $ROLLUP_DIR
 ```
-Only copy the **data dir**. The config (with its `node_id`) comes from §5. If `ls -la $ROLLUP_DIR` in §2.2 showed node-specific files, exclude them with `--exclude`.
 
-### 7-A (no old replica, or copy not wanted): sync from DA
-Leave `$ROLLUP_DIR` empty and go to §8. This only works if the DA node still serves the rollup's first DA height (check its pruning window) and the NOMT ht file (§2.3) fits. Can take hours to days.
+### 7.E Fallback: sync from DA
+Leave `$ROLLUP_DIR` empty. This only works if the DA node still serves the rollup's first DA height and the NOMT ht file (§2.3) fits. Can take hours to days.
+
+### 7.1 After the restore (all variants), on each new host
+```bash
+sudo chown -R $SVC_USER: $ROLLUP_DIR
+sudo ls -la $ROLLUP_DIR          # same top-level dirs as an old sequencer (§2.2), with no extra nesting level (wrong $STRIP)
+sudo du -sh $ROLLUP_DIR/*        # sizes close to the old sequencer's / the manifest's
+df -h $DATA                      # ≥ 20% free
+grep -nE '^path|_db_path' $CFG   # [storage] paths point at the restored dirs
+```
+Only the **data** comes from the snapshot. The config (unique `node_id`, `node_role = "Replica"`) and the keys come from §5. If the snapshot contains config or key files, they're the backup node's, so don't use them.
 
 ---
 
@@ -430,6 +621,24 @@ Leave `$ROLLUP_DIR` empty and go to §8. This only works if the DA node still se
 for h in $NEW_NODES; do ssh $SSH_USER@$h "grep -n node_role $CFG && sudo systemctl enable --now $SVC"; done
 ssh $SSH_USER@$NEW1 "journalctl -u $SVC -f"     # watch for errors; Ctrl-C when calm
 ```
+
+### 8.0 Checks right after the first start from the snapshot
+```bash
+# The node must resume near the snapshot height, NOT from genesis
+for h in $NEW_NODES; do printf '%-16s ' $h; curl -s http://$h:$API/ledger/slots/latest | jq .number; done   # ≈ $SNAP_SLOT, then rising
+for h in $NEW_NODES; do curl -s http://$h:$API/rollup/sync-status | jq -c; done                          # Syncing → Synced
+
+# The restored state must be the canonical one: root at the snapshot height matches the leader's
+for h in $OLD_LEADER $NEW_NODES; do printf '%-16s ' $h; curl -s http://$h:$API/ledger/slots/$SNAP_SLOT | jq -r .state_root; done
+```
+**Stop the service and go back to §7** if:
+- the height starts at 0 or 1: the node didn't find the restored data (wrong `$STRIP` or `[storage]` path)
+- the service fails to open the DB: an inconsistent snapshot or a version mismatch (check `journalctl -u $SVC`)
+- the state roots differ
+
+To redo it: `sudo systemctl stop $SVC && sudo find $ROLLUP_DIR -mindepth 1 -delete`, then restore again.
+
+Catch-up time is roughly the DA blocks since the snapshot ÷ the replay rate. That's minutes to a few hours for a snapshot < 24 h old.
 
 ### 8.1 Sync checks
 ```bash
@@ -531,7 +740,7 @@ What should happen within seconds:
 2. T2: *"Replica acquired leadership! Exiting to restart as leader."* → systemd restart → *"DbElected node acquired leadership, running as BatchProducer"*.
 3. T3: a short run of non-200 responses, then 200 again.
 
-Move the write endpoint now **if** it's an EIP or DNS (§2.7 b/c):
+Move the write endpoint now **if** it's an EIP, DNS, or LB (§2.7 b/c/d):
 ```bash
 # (b) Elastic IP
 aws ec2 associate-address --allocation-id <eipalloc-…> --instance-id <NEW1 instance id> --allow-reassociation
@@ -611,9 +820,10 @@ After the soak:
 
 | Step | Duration |
 |---|---|
-| §2 pre-flight | 1 h |
+| §2 pre-flight (incl. §2.11 snapshot checks) | 1.5 h |
 | §3–§6 IaC, provision, verify | 2–4 h |
-| §7 copy | ~1–2 h per 3 TB |
+| §7 snapshot restore (both hosts in parallel) | ~1–2 h per 3 TB (S3 stream); slower for EBS lazy-load |
+| §8.0 catch-up from snapshot height | minutes to a few hours |
 | §8 sync + soak | ≥ 24 h |
 | §9–§12 routing + cutover | 1 h (write pause: seconds) |
 | §13 soak + decommission | 24–48 h, then 1 h |
