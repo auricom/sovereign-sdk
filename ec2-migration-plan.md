@@ -1,7 +1,7 @@
 # Runbook: migrate dev sequencers from i8g.12xlarge to i8g.4xlarge with no downtime
 
 > Nothing in this runbook has been executed. All commands are meant to be run by a human, in order, one environment at a time.
-> The Terraform/Ansible code for the dev servers is **not** in `sovereign-sdk`. Infra snippets are templates: adapt resource names and paths to your infra repo.
+> There's no Terraform for the dev servers yet. AWS resources are created and removed **manually with the `aws` CLI**, and hosts are configured with **Ansible**. Ansible snippets are templates: adapt role, variable and inventory names to your Ansible repo. Every AWS resource created here is tagged and logged (§3.0), so the future Terraform codebase can import it.
 > Everything about sequencer behaviour (roles, leader election, endpoints) comes from the SDK source in this repo.
 
 ---
@@ -51,12 +51,15 @@ export PGURL='postgresql://<user>:<pass>@<host>:5432/<db>'
 export SSH_USER=<ssh user>
 export OLD_LEADER=<private ip>
 export OLD_REPLICAS="<ip> <ip>"          # may be empty
-export NEW1=<ip>                         # filled after §3.3; this one becomes the leader
+export NEW1=<ip>                         # filled after §3.2; this one becomes the leader
 export NEW2=<ip>                         # standby
 export NEW_NODES="$NEW1 $NEW2"
 export WRITE_ENDPOINT=<host:port clients use to submit txs>
 export BACKUP_NODE=<ip of the backup node that takes snapshots>
 export SNAP_URI=<s3://bucket/prefix where snapshots land, e.g. s3://<bucket>/<env>/>   # S3 variant (§7.A)
+export TG_ARN=<target group arn, if an LB is used (§2.7 d)>
+# OLD_LEADER_ID, OLD_IDS, NEW1_ID, NEW2_ID, NEW1, NEW2 are set in §3 and appended to the migration log:
+# in any new shell run `source ~/i8g-migration-$ENV.env`
 ```
 
 Find the values on an old host:
@@ -206,115 +209,181 @@ aws s3 cp $SNAP_OBJ - | zstd -dc | tar -tf - | head -50
 
 ---
 
-## 3. Terraform: add new instances (don't modify old ones)
+## 3. AWS CLI: launch the new instances (never modify the old ones)
 
-### 3.1 Code change
-Don't edit `instance_type` on the existing resource: that forces replacement and wipes the instance store. **Copy** the resource and everything attached to it:
+There's no Terraform yet, so every AWS change is a manual `aws` CLI command run by a human. Run each command that changes something with `--dry-run` first: it checks permissions and parameters and creates nothing. **Record every ID you create in the migration log (§3.0).** It's the only state, and it's what the future Terraform codebase will import.
 
-```hcl
-# Existing block stays untouched until §13.
-resource "aws_instance" "sequencer_v2" {
-  for_each      = toset(["0", "1"])                  # NEW1, NEW2
-  ami           = <same as old>
-  instance_type = "i8g.4xlarge"
-  subnet_id     = <same subnet / AZ as old>
-  vpc_security_group_ids = <same SGs as old>         # must reach Postgres, DA RPC; reachable by LB/proxy/Prometheus
-  iam_instance_profile   = <same as old>
-  key_name               = <same as old>
-  root_block_device { <same as old> }
-  user_data = templatefile("${path.module}/user_data_v2.sh.tftpl", { mount = "<DATA>" })   # NEW file, see §4
-  tags = merge(<old tags>, { Name = "<env>-sequencer-v2-${each.key}" })
-}
-# Copy the attachments too: aws_lb_target_group_attachment / aws_eip / aws_route53_record / extra SG rules … with *_v2 names
-```
+Don't resize in place. `stop → modify-instance-attribute --instance-type → start` wipes the instance store (the RAID) and is downtime. **Never stop or start the old instances.**
 
-**User-data trap:** if you edit a user_data template that the **old** instances also use, Terraform plans an in-place `user_data` update. The AWS provider applies that by **stopping and starting** the instance, which **wipes the RAID**. So use a new template file (as above), or add `lifecycle { ignore_changes = [user_data] }` to the old resource.
-
-If the sequencers are in an ASG or launch template, don't use instance refresh. Create the v2 instances as standalone resources as above.
-
-**Snapshot read access** (needed for §7.A; skip for §7.B/§7.C). Add a read-only policy as a *new* resource on the role behind the instance profile, so the plan shows an add, not a change:
-
-```hcl
-resource "aws_iam_role_policy" "sequencer_snapshot_read" {
-  name = "<env>-sequencer-snapshot-read"
-  role = <role name behind the sequencer instance profile>
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      { Effect = "Allow", Action = ["s3:ListBucket"], Resource = "arn:aws:s3:::<bucket>",
-        Condition = { StringLike = { "s3:prefix" = ["<prefix>/*"] } } },
-      { Effect = "Allow", Action = ["s3:GetObject"], Resource = "arn:aws:s3:::<bucket>/<prefix>/*" },
-      # only if the bucket uses SSE-KMS:
-      { Effect = "Allow", Action = ["kms:Decrypt"], Resource = "<kms key arn>" },
-    ]
-  })
-}
-```
-For §7.B (EBS snapshot) the operator's credentials need `ec2:CreateVolume`, `ec2:AttachVolume`, `ec2:DetachVolume`, `ec2:DeleteVolume` and `ec2:CreateTags`. The instance doesn't need them.
-
-The v2 subnet must reach S3 (VPC S3 gateway endpoint or NAT). Without a gateway endpoint, multi-TB downloads go through the NAT and you pay NAT data-processing charges.
-
-### 3.2 Validate and plan (safe)
+### 3.0 Migration log
 ```bash
-cd <infra-repo>/terraform/<path-to-dev-env>
-terraform fmt -recursive
-terraform init                  # never with -migrate-state / -reconfigure
-terraform validate
-terraform plan -out=tfplan-i8g-4xl
-terraform show -no-color tfplan-i8g-4xl | grep -E '^\s+# |^Plan:'
+export LOG=~/i8g-migration-$ENV.env
+echo "# i8g migration $ENV started $(date -u +%FT%TZ)" >> $LOG
+# Append every ID you create, e.g. echo "NEW1_ID=i-…" >> $LOG
+# In a new shell:  source $LOG
 ```
-(terragrunt: `terragrunt init && terragrunt validate && terragrunt plan -out=tfplan-i8g-4xl`)
 
-**The plan must show `Plan: N to add, 0 to change, 0 to destroy.`** Any change or destroy on `aws_instance.sequencer*` means STOP and fix the code.
-
-### 3.3 Apply (human)
+### 3.1 Capture the old instances' settings
 ```bash
-terraform apply tfplan-i8g-4xl
-terraform output    # or:
-aws ec2 describe-instances --filters "Name=tag:Name,Values=<env>-sequencer-v2-*" \
-  --query 'Reservations[].Instances[].{id:InstanceId,type:InstanceType,ip:PrivateIpAddress,state:State.Name}' --output table
+export OLD_LEADER_ID=<instance id of the old leader>
+export OLD_IDS="<old leader id> <old replica ids…>"
+echo "OLD_IDS=\"$OLD_IDS\"" >> $LOG
+
+aws ec2 describe-instances --instance-ids $OLD_LEADER_ID --query 'Reservations[0].Instances[0].{ami:ImageId,arch:Architecture,subnet:SubnetId,az:Placement.AvailabilityZone,sgs:SecurityGroups[].GroupId,profile:IamInstanceProfile.Arn,key:KeyName,root:RootDeviceName,imds:MetadataOptions.HttpTokens}' --output json
+aws ec2 describe-instances --instance-ids $OLD_LEADER_ID --query 'Reservations[0].Instances[0].Tags' --output table
+aws ec2 describe-volumes --filters Name=attachment.instance-id,Values=$OLD_LEADER_ID \
+  --query 'Volumes[].{dev:Attachments[0].Device,size:Size,type:VolumeType,iops:Iops,tp:Throughput,enc:Encrypted,kms:KmsKeyId,delOnTerm:Attachments[0].DeleteOnTermination}' --output table
+aws ec2 describe-instance-attribute --instance-id $OLD_LEADER_ID --attribute userData --query 'UserData.Value' --output text | base64 -d   # usually empty when Ansible does everything
+aws ec2 describe-addresses --filters Name=instance-id,Values=$OLD_LEADER_ID      # Elastic IP? (§2.7 b)
 ```
-Set `NEW1`, `NEW2`, `NEW_NODES` from the output.
+Copy the values into variables:
+```bash
+export AMI=<ImageId>
+export SUBNET=<SubnetId of the old leader>        # same AZ as the old leader and Postgres
+export SUBNET_B=<subnet for NEW2>                 # same as SUBNET, or the AZ the old replicas use
+export SGS="<sg-… sg-…>"
+export PROFILE_ARN=<IamInstanceProfile.Arn>
+export KEY=<KeyName>
+export ROOT_DEV=<RootDeviceName, e.g. /dev/sda1>
+export ROOT_SIZE=<GiB of the root volume>
+export EXTRA_TAGS='<tags from the old instance that monitoring / dynamic inventory / cost reports rely on, e.g. {Key=Project,Value=sovereign},>'
+```
+Check the AMI:
+```bash
+aws ec2 describe-images --image-ids $AMI --query 'Images[0].{name:Name,arch:Architecture,state:State,deprecated:DeprecationTime}'
+```
+It must be `arm64` (i8g is Graviton) and `available`. If it's been deregistered, use the current arm64 AMI of the **same distro release**. Ansible then brings the host to the same state.
+
+### 3.2 Launch the two instances
+```bash
+# $1 = index (0|1), $2 = subnet, other args go straight to run-instances (e.g. --dry-run)
+launch() {
+  aws ec2 run-instances "${@:3}" \
+    --image-id "$AMI" --instance-type i8g.4xlarge --count 1 \
+    --subnet-id "$2" --security-group-ids $SGS \
+    --iam-instance-profile Arn="$PROFILE_ARN" --key-name "$KEY" \
+    --block-device-mappings "DeviceName=$ROOT_DEV,Ebs={VolumeSize=$ROOT_SIZE,VolumeType=gp3,Encrypted=true,DeleteOnTermination=true}" \
+    --metadata-options HttpTokens=required,HttpEndpoint=enabled \
+    --disable-api-termination --disable-api-stop \
+    --tag-specifications \
+      "ResourceType=instance,Tags=[${EXTRA_TAGS}{Key=Name,Value=$ENV-sequencer-v2-$1},{Key=Env,Value=$ENV},{Key=Role,Value=sequencer},{Key=Migration,Value=i8g-4xl},{Key=ManagedBy,Value=manual}]" \
+      "ResourceType=volume,Tags=[{Key=Name,Value=$ENV-sequencer-v2-$1-root},{Key=Env,Value=$ENV}]" \
+    --query 'Instances[0].InstanceId' --output text
+}
+
+launch 0 "$SUBNET"   --dry-run      # expect: "DryRunOperation … Request would have succeeded"
+launch 1 "$SUBNET_B" --dry-run
+```
+- `--disable-api-stop` blocks accidental API stops (a stop wipes the instance store). Reboot still works.
+- `--disable-api-termination` blocks accidental termination. Both are lifted in §13 or §14.
+- If the old root volume uses a customer KMS key, add `KmsKeyId=<arn>` inside `Ebs={…}`.
+- No block-device mapping is needed for the NVMe drive: instance store on i8g is attached automatically.
+
+Launch for real (human):
+```bash
+NEW1_ID=$(launch 0 "$SUBNET");   echo "NEW1_ID=$NEW1_ID" >> $LOG
+NEW2_ID=$(launch 1 "$SUBNET_B"); echo "NEW2_ID=$NEW2_ID" >> $LOG
+aws ec2 wait instance-status-ok --instance-ids $NEW1_ID $NEW2_ID
+aws ec2 describe-instances --instance-ids $NEW1_ID $NEW2_ID \
+  --query 'Reservations[].Instances[].{id:InstanceId,name:Tags[?Key==`Name`]|[0].Value,type:InstanceType,ip:PrivateIpAddress,az:Placement.AvailabilityZone,state:State.Name}' --output table
+```
+```bash
+export NEW1=<private ip of v2-0> NEW2=<private ip of v2-1>; export NEW_NODES="$NEW1 $NEW2"
+echo "NEW1=$NEW1 NEW2=$NEW2" >> $LOG
+```
+`InsufficientInstanceCapacity` means AWS has no i8g.4xlarge free in that AZ right now. Retry later or use another subnet or AZ (Postgres latency matters for the leader: keep NEW1 close to Postgres).
+
+### 3.3 Network access
+The new hosts reuse the old SGs, so rules that reference the SG itself already apply. Rules that whitelist the **old hosts' IPs** don't. Check Postgres, the DA node, the LB/proxy and Prometheus:
+```bash
+aws ec2 describe-security-groups --group-ids <sg of Postgres / DA node / proxy> \
+  --query 'SecurityGroups[].{sg:GroupId,in:IpPermissions[].{p:FromPort,cidr:IpRanges[].CidrIp,sg:UserIdGroupPairs[].GroupId}}' --output json
+# Only if an old host's /32 is listed:
+aws ec2 authorize-security-group-ingress --group-id <sg> --dry-run \
+  --ip-permissions "IpProtocol=tcp,FromPort=<port>,ToPort=<port>,IpRanges=[{CidrIp=$NEW1/32,Description=$ENV-sequencer-v2-0},{CidrIp=$NEW2/32,Description=$ENV-sequencer-v2-1}]"
+# then without --dry-run, and log it:
+echo "SG_RULE <sg> <port> $NEW1/32 $NEW2/32" >> $LOG
+```
+If Postgres restricts clients in `pg_hba.conf` (Ansible-managed), add the new IPs there too.
+
+### 3.4 Snapshot read access (§7.A only)
+```bash
+ROLE=$(aws iam get-instance-profile --instance-profile-name "${PROFILE_ARN##*/}" --query 'InstanceProfile.Roles[0].RoleName' --output text); echo $ROLE
+aws iam list-role-policies --role-name $ROLE; aws iam list-attached-role-policies --role-name $ROLE   # maybe it can already read the bucket
+cat > /tmp/snapshot-read.json <<'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::<bucket>",
+      "Condition": { "StringLike": { "s3:prefix": ["<prefix>/*"] } } },
+    { "Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::<bucket>/<prefix>/*" },
+    { "Effect": "Allow", "Action": "kms:Decrypt", "Resource": "<kms key arn, remove this statement if the bucket uses SSE-S3>" }
+  ]
+}
+EOF
+aws iam put-role-policy --role-name $ROLE --policy-name $ENV-sequencer-snapshot-read --policy-document file:///tmp/snapshot-read.json
+echo "IAM_INLINE_POLICY $ROLE $ENV-sequencer-snapshot-read" >> $LOG
+ssh $SSH_USER@$NEW1 "aws s3 ls $SNAP_URI | tail -3"          # works within a few seconds
+```
+The role is shared with the old hosts, so they also get read access. That's harmless; remove it after the migration with `aws iam delete-role-policy --role-name $ROLE --policy-name $ENV-sequencer-snapshot-read`.
+
+S3 path: without an S3 gateway endpoint, multi-TB downloads go through the NAT gateway and you pay data-processing charges.
+```bash
+VPC=$(aws ec2 describe-subnets --subnet-ids $SUBNET --query 'Subnets[0].VpcId' --output text)
+aws ec2 describe-vpc-endpoints --filters Name=vpc-id,Values=$VPC Name=service-name,Values=com.amazonaws.$AWS_REGION.s3 \
+  --query 'VpcEndpoints[].{id:VpcEndpointId,type:VpcEndpointType,routeTables:RouteTableIds}'
+```
+If none is attached to the new subnet's route table, either accept the NAT cost or have the VPC owner add one.
+
+§7.B (EBS snapshot) only needs operator credentials with `ec2:CreateVolume`, `ec2:AttachVolume`, `ec2:DetachVolume`, `ec2:DeleteVolume` and `ec2:CreateTags`.
 
 ---
 
-## 4. Disk provisioning: 1 NVMe → no RAID, several → RAID0
+## 4. Ansible: inventory and disk provisioning
 
-Use **either** user-data (4.1) **or** the Ansible role (4.2), whichever builds the RAID today. Keep the **same mount point and filesystem type** as `findmnt` showed in §2.1, so no service or config paths change.
+### 4.1 Inventory
+Put the new hosts in their **own group**, so every run can be `--limit`ed to them and the old hosts are never touched. Make it a child of the existing sequencer group so it inherits the same vars (binary version, secrets, Postgres URL, monitoring):
 
-### 4.1 user-data script (`user_data_v2.sh.tftpl`), idempotent
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-MOUNT="${mount}"
-FSTYPE=xfs                        # match §2.1
-MDADM_CONF=/etc/mdadm/mdadm.conf  # RHEL/AL2023: /etc/mdadm.conf
-
-findmnt -rn "$MOUNT" >/dev/null && { echo "$MOUNT already mounted"; exit 0; }
-
-# Instance-store NVMe only. The EBS root reports model "Amazon Elastic Block Store".
-mapfile -t devs < <(lsblk -dpno NAME,MODEL | awk '/Amazon EC2 NVMe Instance Storage/{print $1}' | sort)
-(( $${#devs[@]} >= 1 )) || { echo "no instance-store NVMe found" >&2; exit 1; }
-
-if (( $${#devs[@]} == 1 )); then
-  dev="$${devs[0]}"                                   # i8g.4xlarge
-else
-  dev=/dev/md0                                        # multi-disk types keep RAID0
-  [ -e "$dev" ] || mdadm --create "$dev" --level=0 --raid-devices="$${#devs[@]}" --run "$${devs[@]}"
-  mdadm --detail --scan > "$MDADM_CONF"
-  update-initramfs -u || dracut -f
-fi
-
-# Format only if blank. Instance store survives reboot but is wiped on stop/start.
-blkid -o value -s TYPE "$dev" >/dev/null || mkfs.$FSTYPE -f "$dev"
-uuid=$(blkid -o value -s UUID "$dev")
-mkdir -p "$MOUNT"
-grep -q "$uuid" /etc/fstab || echo "UUID=$uuid $MOUNT $FSTYPE defaults,noatime,nofail 0 2" >> /etc/fstab
-mount "$MOUNT"
+```yaml
+# inventories/<dev>/hosts.yml (static inventory)
+all:
+  children:
+    sequencers:                     # existing group, old hosts unchanged
+      hosts:
+        <old hosts …>:
+      children:
+        sequencers_v2:
+          hosts:
+            <env>-sequencer-v2-0: { ansible_host: <NEW1 ip> }
+            <env>-sequencer-v2-1: { ansible_host: <NEW2 ip> }
 ```
-(`$$` escapes `$` inside a Terraform `templatefile`. In a plain script, use single `$`.)
+With the `amazon.aws.aws_ec2` dynamic inventory, add `keyed_groups: [{ key: tags.Migration, prefix: mig }]` and use the group `mig_i8g_4xl` instead of `sequencers_v2`.
 
-### 4.2 Ansible tasks (replace the fixed-3-device mdadm tasks in the disk role)
+Per-host and per-group vars (use the variable names your config template already uses: `grep -rn 'node_role\|node_id' roles/ templates/`):
+```yaml
+# inventories/<dev>/host_vars/<env>-sequencer-v2-0.yml
+sequencer_node_id: <env>-seq-v2-0
+sequencer_node_role: Replica          # → DbElected in §10
+
+# inventories/<dev>/host_vars/<env>-sequencer-v2-1.yml
+sequencer_node_id: <env>-seq-v2-1
+sequencer_node_role: Replica          # → DbElected in §12
+
+# inventories/<dev>/group_vars/sequencers_v2.yml  (child-group vars override the parent's)
+data_mount: <same mount point as old, §2.1>
+rollup_service_enabled: false         # don't start before the data is restored (§8 flips it)
+rollup_service_state: stopped
+# + tuned storage settings from §5.1
+```
+Check (safe):
+```bash
+ansible-inventory -i inventories/<dev> --graph
+ansible-inventory -i inventories/<dev> --host <env>-sequencer-v2-0      # merged vars: node_id, role, tuned values
+ansible -i inventories/<dev> sequencers_v2 -m ansible.builtin.ping
+```
+
+### 4.2 Disk role: 1 NVMe → no RAID, several → RAID0
+Replace the fixed-3-device mdadm tasks in the disk role. Keep the **same mount point and filesystem type** as `findmnt` showed in §2.1, so no service or config paths change.
 ```yaml
 - name: Discover instance-store NVMe devices
   ansible.builtin.set_fact:
@@ -361,32 +430,54 @@ mount "$MOUNT"
 ```
 Remove any hard-coded `/dev/md0` from other roles or templates (fstab, node_exporter mountpoint filters, alerts).
 
-Safe checks (OK to run):
+**Never run this updated role on the old hosts.** Their fstab entry would switch from `/dev/md0` to `UUID=…` and the data volume would be remounted. Every run stays `--limit sequencers_v2` until the old hosts are gone (§13).
+
+### 4.3 No Ansible disk role today? One-off script
+If the RAID on the old hosts was built by hand, run this once per new host instead of §4.2: `ssh $SSH_USER@$NEW1 'sudo bash -s' < setup-nvme.sh`
 ```bash
-ansible-lint roles/<disk-role>
-ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit '<new hosts group>' --syntax-check
-ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit '<new hosts group>' --list-tasks
-ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit '<new hosts group>' --check --diff
+#!/usr/bin/env bash
+# setup-nvme.sh: idempotent; 1 instance-store NVMe → plain fs, several → RAID0
+set -euo pipefail
+MOUNT=<same mount point as old, §2.1>
+FSTYPE=xfs                        # match §2.1
+MDADM_CONF=/etc/mdadm/mdadm.conf  # RHEL/AL2023: /etc/mdadm.conf
+
+findmnt -rn "$MOUNT" >/dev/null && { echo "$MOUNT already mounted"; exit 0; }
+
+# Instance-store NVMe only. The EBS root reports model "Amazon Elastic Block Store".
+mapfile -t devs < <(lsblk -dpno NAME,MODEL | awk '/Amazon EC2 NVMe Instance Storage/{print $1}' | sort)
+(( ${#devs[@]} >= 1 )) || { echo "no instance-store NVMe found" >&2; exit 1; }
+
+if (( ${#devs[@]} == 1 )); then
+  dev="${devs[0]}"
+else
+  dev=/dev/md0
+  [ -e "$dev" ] || mdadm --create "$dev" --level=0 --raid-devices="${#devs[@]}" --run "${devs[@]}"
+  mdadm --detail --scan > "$MDADM_CONF"
+  update-initramfs -u || dracut -f
+fi
+
+# Format only if blank. Instance store survives reboot but is wiped on stop/start.
+blkid -o value -s TYPE "$dev" >/dev/null || mkfs.$FSTYPE -f "$dev"
+uuid=$(blkid -o value -s UUID "$dev")
+mkdir -p "$MOUNT"
+grep -q "$uuid" /etc/fstab || echo "UUID=$uuid $MOUNT $FSTYPE defaults,noatime,nofail 0 2" >> /etc/fstab
+mount "$MOUNT"
 ```
-Apply (human), **new hosts only**:
-```bash
-ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit '<new hosts group>'
-```
-Add a new group (e.g. `sequencers_v2`) to the inventory so `--limit` can't touch the old hosts.
 
 ---
 
-## 5. Rollup config and systemd for the new hosts
+## 5. Ansible: rollup config and systemd for the new hosts
 
-### 5.1 Config differences vs the old hosts (template per host)
-Find the section that holds `node_role` in today's config: `grep -n -B5 node_role $CFG`. Same section, new values:
+### 5.1 Config differences vs the old hosts
+The config template renders these from the §4.1 vars. Find the section that holds `node_role` in today's config with `grep -n -B5 node_role $CFG` on an old host. Same section, new values:
 ```toml
 postgres_connection_string = "<same as old>"
 node_id   = "<env>-seq-v2-0"           # NEW2: "<env>-seq-v2-1"; must be unique
 node_role = "Replica"                  # Replica during sync; changed in §10 / §12
 # [leader_election]: identical to old nodes (or omitted on all)
 ```
-Storage and sequencer tuning for 16 vCPU / 128 GiB. Start from the old values and scale:
+Storage and sequencer tuning for 16 vCPU / 128 GiB (in `group_vars/sequencers_v2.yml`). Start from the old values and scale:
 ```toml
 # [storage]
 state_cache_size          = <old ÷ 3>
@@ -396,27 +487,52 @@ user_page_cache_size      = <old ÷ 3>
 user_leaf_cache_size      = <old ÷ 3>
 kernel_page_cache_size    = <old ÷ 3>
 kernel_leaf_cache_size    = <old ÷ 3>
-user_hashtable_buckets    = <UNCHANGED: must match the copied DB>
+user_hashtable_buckets    = <UNCHANGED: must match the restored DB>
 kernel_hashtable_buckets  = <UNCHANGED>
 # [sequencer]
 num_cache_warmup_workers  = <min(old, 8)>
 ```
-Keep the same sequencer signing key and secrets, deployed the same way as on the old hosts.
+Keep the same sequencer signing key and secrets, deployed by the same Ansible tasks as on the old hosts.
 
-### 5.2 systemd (required for DbElected takeover)
-Via Ansible template or by hand on each new host:
-```bash
-sudo systemctl edit $SVC
-# add:
-# [Service]
-# Restart=always
-# RestartSec=1
-# TimeoutStopSec=300
-systemctl show $SVC -p Restart,RestartUSec,TimeoutStopUSec
+### 5.2 systemd restart policy (required for DbElected takeover)
+Add to the rollup role, unless the unit template already has these settings:
+```yaml
+- name: Rollup service restart policy (DbElected takeover needs an automatic restart)
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ rollup_service }}.d/override.conf"     # rollup_service = e.g. rollup.service
+    content: |
+      [Service]
+      Restart=always
+      RestartSec=1
+      TimeoutStopSec=300
+    mode: "0644"
+  notify: Reload systemd
 ```
-**Install the binary and config, but don't start the service yet:**
+```yaml
+# handlers
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+```
+The task that manages the service must follow `rollup_service_enabled` / `rollup_service_state` (§4.1), so the new hosts get the binary and config **without starting**.
+
+### 5.3 Run the playbook on the new hosts only
+Safe checks:
 ```bash
-sudo systemctl disable $SVC      # keep it off until §8
+ansible-lint roles/<disk-role> roles/<rollup-role>
+ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit sequencers_v2 --syntax-check
+ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit sequencers_v2 --list-tasks
+ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit sequencers_v2 --check --diff
+```
+Apply (human):
+```bash
+ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit sequencers_v2
+```
+Verify:
+```bash
+ansible -i inventories/<dev> sequencers_v2 -b -m ansible.builtin.shell \
+  -a "systemctl is-active $SVC; systemctl show $SVC -p Restart; grep -nE 'node_id|node_role' $CFG; findmnt -no SOURCE,FSTYPE $DATA"
+# expect: inactive, Restart=always, the v2 node_id, Replica, the NVMe device (not md0)
 ```
 
 ---
@@ -466,7 +582,7 @@ Both new hosts restore **the same** snapshot, **in parallel** and independently 
 ssh $SSH_USER@$NEW1                            # then the same on NEW2
 systemctl is-active $SVC                       # must print 'inactive'
 sudo apt-get install -y zstd pv jq tmux        # or dnf; use pigz / lz4 instead of zstd if the archive uses them
-aws --version && aws sts get-caller-identity   # §7.A only: instance profile from §3.1 works
+aws --version && aws sts get-caller-identity   # §7.A only: snapshot read access from §3.4 works
 sudo mkdir -p $ROLLUP_DIR
 sudo ls -A $ROLLUP_DIR                         # must print nothing (empty dir)
 df -h $DATA                                    # free ≥ uncompressed snapshot size + 20%
@@ -617,8 +733,10 @@ Only the **data** comes from the snapshot. The config (unique `node_id`, `node_r
 
 ## 8. Start the new nodes as `Replica` and wait for head
 
+In `inventories/<dev>/group_vars/sequencers_v2.yml` set `rollup_service_enabled: true` and `rollup_service_state: started`, then:
 ```bash
-for h in $NEW_NODES; do ssh $SSH_USER@$h "grep -n node_role $CFG && sudo systemctl enable --now $SVC"; done
+ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit sequencers_v2 --check --diff   # only the service state should change
+ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit sequencers_v2
 ssh $SSH_USER@$NEW1 "journalctl -u $SVC -f"     # watch for errors; Ctrl-C when calm
 ```
 
@@ -680,7 +798,9 @@ max_over_time(rate(node_disk_io_time_seconds_total{instance=~"<new hosts>",devic
 ALB/NLB example:
 ```bash
 export TG_ARN=<target group arn>
-aws elbv2 register-targets --target-group-arn $TG_ARN --targets Id=<NEW1 instance id>,Port=$API Id=<NEW2 instance id>,Port=$API
+aws elbv2 describe-target-groups --target-group-arns $TG_ARN --query 'TargetGroups[0].{port:Port,hc:HealthCheckPath}'
+aws elbv2 register-targets --target-group-arn $TG_ARN --targets Id=$NEW1_ID,Port=$API Id=$NEW2_ID,Port=$API
+echo "TG_TARGETS $TG_ARN $NEW1_ID $NEW2_ID" >> $LOG
 aws elbv2 describe-target-health --target-group-arn $TG_ARN --output table   # wait for 'healthy'
 ```
 (Proxy with node discovery: nothing to do, the nodes are in the `nodes` table.)
@@ -691,12 +811,15 @@ Watch the LB 5xx rate for 30 min.
 ## 10. Make NEW1 the only leader candidate
 
 Only NEW1 becomes `DbElected` now, so the winner is known in advance (simplifies EIP/DNS moves). NEW2 stays `Replica` until §12.
+In `inventories/<dev>/host_vars/<env>-sequencer-v2-0.yml` set `sequencer_node_role: DbElected`, then run on **that host only**:
 ```bash
-ssh $SSH_USER@$NEW1
-sudo sed -i 's/^node_role *= *"Replica"/node_role = "DbElected"/' $CFG    # or via Ansible template
-grep -n node_role $CFG
-sudo systemctl restart $SVC
-journalctl -u $SVC --since '-2min' | grep -E 'DbElected node did not acquire leadership|PgSyncReplica'
+ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit <env>-sequencer-v2-0 --check --diff   # only node_role in $CFG changes
+ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit <env>-sequencer-v2-0
+ssh $SSH_USER@$NEW1 "grep -n node_role $CFG; systemctl show $SVC -p ActiveEnterTimestamp"
+```
+If the role has no restart handler on config changes, restart it yourself: `ssh $SSH_USER@$NEW1 "sudo systemctl restart $SVC"`. Then:
+```bash
+ssh $SSH_USER@$NEW1 "journalctl -u $SVC --since '-2min' | grep -E 'DbElected node did not acquire leadership|PgSyncReplica'"
 ```
 Expect *"DbElected node did not acquire leadership, running as PgSyncReplica"*. Then re-run the §8.1 height check until NEW1 is back at head.
 
@@ -743,12 +866,13 @@ What should happen within seconds:
 Move the write endpoint now **if** it's an EIP, DNS, or LB (§2.7 b/c/d):
 ```bash
 # (b) Elastic IP
-aws ec2 associate-address --allocation-id <eipalloc-…> --instance-id <NEW1 instance id> --allow-reassociation
+aws ec2 associate-address --allocation-id <eipalloc-…> --instance-id $NEW1_ID --allow-reassociation
 # (c) Route53
 aws route53 change-resource-record-sets --hosted-zone-id <ZONE> --change-batch '{"Changes":[{"Action":"UPSERT","ResourceRecordSet":{"Name":"<write.fqdn>","Type":"A","TTL":30,"ResourceRecords":[{"Value":"'$NEW1'"}]}}]}'
 # (d) LB
-aws elbv2 deregister-targets --target-group-arn $TG_ARN --targets Id=<old leader id>,Port=$API
+aws elbv2 deregister-targets --target-group-arn $TG_ARN --targets Id=$OLD_LEADER_ID,Port=$API
 ```
+From now until §13, **never run the playbook against the old hosts** (always `--limit sequencers_v2`). A role that enforces `state: started` would try to bring the old leader back.
 
 ### 11.5 Post-cutover verification
 ```bash
@@ -765,13 +889,13 @@ curl -s http://$WRITE_ENDPOINT/sequencer/txs/<tx_hash>/status | jq
 ---
 
 ## 12. Make NEW2 a standby candidate
+In `inventories/<dev>/host_vars/<env>-sequencer-v2-1.yml` set `sequencer_node_role: DbElected`, then:
 ```bash
-ssh $SSH_USER@$NEW2
-sudo sed -i 's/^node_role *= *"Replica"/node_role = "DbElected"/' $CFG
-sudo systemctl restart $SVC
-journalctl -u $SVC --since '-2min' | grep -E 'did not acquire leadership'
+ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit <env>-sequencer-v2-1 --check --diff
+ansible-playbook -i inventories/<dev> playbooks/<sequencer>.yml --limit <env>-sequencer-v2-1
+ssh $SSH_USER@$NEW2 "journalctl -u $SVC --since '-2min' | grep -E 'did not acquire leadership'"   # restart by hand first if the role has no handler
 ```
-Commit the final per-host config (`DbElected`, new `node_id`s, tuned caches) into the infra repo so Ansible doesn't revert it.
+Commit all inventory, host_vars, group_vars and role changes to the Ansible repo.
 
 ---
 
@@ -779,21 +903,44 @@ Commit the final per-host config (`DbElected`, new `node_id`s, tuned caches) int
 
 During the soak, **leave the old instances running with the service masked**. Stopping them wipes the instance store and makes a quick rollback impossible.
 
-After the soak:
-1. Remove the old `aws_instance.sequencer` block and its attachments (EIP, TG attachments, DNS, SG rules that only old hosts use) from Terraform.
-2. Plan (safe):
+After the soak (all AWS commands are run by a human):
+
+1. **Confirm exactly which instances you're about to delete.** They must be the 12xlarge ones, and none of the v2 IDs may be in the list:
    ```bash
-   terraform plan -out=tfplan-decom
-   terraform show -no-color tfplan-decom | grep -E '^\s+# |^Plan:'      # ONLY old resources destroyed, 0 add, 0 change
-   terraform state show 'aws_instance.sequencer[0]' | grep -E '^\s+(id|instance_type|private_ip) '   # confirm they're the 12xlarge ones
+   source $LOG
+   aws ec2 describe-instances --instance-ids $OLD_IDS \
+     --query 'Reservations[].Instances[].{id:InstanceId,name:Tags[?Key==`Name`]|[0].Value,type:InstanceType,ip:PrivateIpAddress,state:State.Name}' --output table
+   for id in $OLD_IDS; do [ "$id" = "$NEW1_ID" ] || [ "$id" = "$NEW2_ID" ] && echo "STOP: $id is a v2 instance"; done
    ```
-3. Human: `terraform apply tfplan-decom`
-4. Clean up:
-   - Ansible inventory: remove old hosts, then rename `sequencers_v2` to the normal group.
+2. **List what's attached to them**, so nothing is orphaned or left billing:
+   ```bash
+   aws ec2 describe-addresses --filters Name=instance-id,Values=${OLD_IDS// /,} --query 'Addresses[].{ip:PublicIp,alloc:AllocationId,inst:InstanceId}'
+   aws ec2 describe-volumes --filters Name=attachment.instance-id,Values=${OLD_IDS// /,} \
+     --query 'Volumes[].{id:VolumeId,inst:Attachments[0].InstanceId,delOnTerm:Attachments[0].DeleteOnTermination}' --output table
+   aws elbv2 describe-target-health --target-group-arn $TG_ARN --query 'TargetHealthDescriptions[].Target.Id'   # old ids must be gone (§11)
+   ```
+3. **Remove termination protection, then terminate** (try `--dry-run` first):
+   ```bash
+   for id in $OLD_IDS; do aws ec2 modify-instance-attribute --instance-id $id --no-disable-api-termination; done
+   aws ec2 terminate-instances --instance-ids $OLD_IDS --dry-run
+   aws ec2 terminate-instances --instance-ids $OLD_IDS
+   aws ec2 wait instance-terminated --instance-ids $OLD_IDS
+   echo "TERMINATED $OLD_IDS $(date -u +%FT%TZ)" >> $LOG
+   ```
+4. **Clean up the leftovers found in step 2:**
+   ```bash
+   aws ec2 release-address --allocation-id <eipalloc-… of the old hosts, only if NOT moved to NEW1 in §11.4>
+   aws ec2 delete-volume --volume-id <vol-… that had DeleteOnTermination=false>
+   aws ec2 revoke-security-group-ingress --group-id <sg> --ip-permissions "IpProtocol=tcp,FromPort=<port>,ToPort=<port>,IpRanges=[{CidrIp=<old ip>/32}]"   # old-IP rules only
+   aws iam delete-role-policy --role-name $ROLE --policy-name $ENV-sequencer-snapshot-read                                                         # §3.4
+   ```
+5. Clean up the rest:
+   - Ansible: remove the old hosts from the inventory, merge `group_vars/sequencers_v2.yml` into the parent group, drop the `sequencers_v2` group, and remove the old fixed-3-disk RAID code. Re-run `ansible-playbook … --check --diff` on the whole group: it must show no changes.
+   - Keep `$LOG` (instance IDs, SG rules, IAM policy, TG targets). Later, the Terraform codebase imports these resources from it instead of recreating them.
    - Prometheus scrape targets and file_sd, Grafana dashboards, alert rules that name hosts or instance IDs. Check with `promtool check config <prometheus.yml>` and `promtool check rules <rules.yml>`.
    - **Disk alerts:** the same % threshold now gives ⅓ of the absolute headroom. Re-tune thresholds and `for:`, or alert on `predict_linear(...[6h], 3*86400) < 0`.
    - SSH `known_hosts`, docs, and runbooks that mention old IPs.
-5. Re-enable automatic deploys to dev, pointed at the new hosts.
+6. Re-enable automatic deploys to dev, pointed at the new hosts.
 
 ---
 
@@ -801,7 +948,7 @@ After the soak:
 
 | When | Action |
 |---|---|
-| Before §11.4 | Stop and mask the new nodes, deregister them from the LB, `terraform destroy` the v2 resources (via plan + human apply). Old cluster untouched. |
+| Before §11.4 | Stop and mask the service on the new nodes and deregister them from the LB (`aws elbv2 deregister-targets … Id=$NEW1_ID … Id=$NEW2_ID`). Then remove them: `aws ec2 modify-instance-attribute --instance-id <id> --no-disable-api-termination` for each, followed by `aws ec2 terminate-instances --instance-ids $NEW1_ID $NEW2_ID`. Revert the §3.3/§3.4 additions listed in `$LOG` and remove `sequencers_v2` from the Ansible inventory. Old cluster untouched. |
 | After §11.4, new leader healthy but you want to go back | On OLD_LEADER: set `node_role = "DbElected"` (**not** `Leader`), `sudo systemctl unmask $SVC && sudo systemctl enable --now $SVC`, wait until it's at head (§8.1). Make sure it has `Restart=always` (§2.8). Then `sudo systemctl disable --now $SVC && sudo systemctl mask $SVC` on NEW2 and then NEW1. The old node takes over within ~1 s. Move the EIP/DNS back. |
 | After §11.4, new leader crash-looping (OOM, disk, …) | 1) `sudo systemctl disable --now $SVC && sudo systemctl mask $SVC` on NEW1 **and** NEW2 (stops it from re-acquiring leadership on every restart). 2) On OLD_LEADER: set `DbElected`, unmask, `enable --now`. It acquires leadership after ~1 s, exits, and restarts as leader. 3) Move the EIP/DNS back. 4) Diagnose with `journalctl -u $SVC`, `journalctl -k \| grep -i oom`, `df -h`. |
 
@@ -821,7 +968,7 @@ After the soak:
 | Step | Duration |
 |---|---|
 | §2 pre-flight (incl. §2.11 snapshot checks) | 1.5 h |
-| §3–§6 IaC, provision, verify | 2–4 h |
+| §3–§6 AWS CLI launch, Ansible, verify | 2–4 h |
 | §7 snapshot restore (both hosts in parallel) | ~1–2 h per 3 TB (S3 stream); slower for EBS lazy-load |
 | §8.0 catch-up from snapshot height | minutes to a few hours |
 | §8 sync + soak | ≥ 24 h |
@@ -834,5 +981,6 @@ Repeat §1–§13 for each dev environment, one at a time.
 - Every dev env runs only i8g.4xlarge sequencers. The single NVMe is mounted at the original mount point by UUID with `nofail`, and there's no md device.
 - `sequencer_leader` holds a v2 node. All v2 nodes are `DbElected`, registered in `nodes`, at head, with matching state roots. Tx submission, soft confirmations, and DA batch publishing work.
 - The only client-visible impact was the seconds-long write pause at cutover.
-- The infra repo contains the v2 instances, the device-count-aware disk provisioning, and the tuned config. The old instances are destroyed. Monitoring and alerts are updated.
+- The Ansible repo contains the new hosts in the inventory, the device-count-aware disk provisioning, the restart policy, and the tuned config. The old hosts are gone from the inventory.
+- The old instances are terminated, with no orphaned EIPs, volumes, SG rules or IAM policies. `$LOG` lists every AWS resource created by hand, ready for a later Terraform import. Monitoring and alerts are updated.
 - After 48 h: RSS < 75% of RAM, disk < 80% used, no OOM or unexpected restarts.
