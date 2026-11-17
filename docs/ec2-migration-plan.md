@@ -106,7 +106,6 @@ export AWS_REGION=us-east-1
 export RO=ReadOnlyAccess-313110633477           # read-only checks
 export RW=<profile with write access to 313110633477>   # [write] steps
 export DOMAIN=relay-devnet.sovereign-labs.xyz
-export API=12346
 export LT_BASE=44                               # latest version of the 3 launch templates before the deploy
 export DOC_BASE=10                              # default version of the 3 values documents before the deploy
 export STACK=SovRollupCdkStarterStack
