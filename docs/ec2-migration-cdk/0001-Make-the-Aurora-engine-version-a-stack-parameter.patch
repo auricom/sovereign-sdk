@@ -1,0 +1,54 @@
+From 44682540155e81fc504e8dada3aac7a259e879b0 Mon Sep 17 00:00:00 2001
+From: auricom <27022259+auricom@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 16:43:30 +0100
+Subject: [PATCH 1/2] Make the Aurora engine version a stack parameter
+
+Aurora applies minor upgrades on its own, so the cluster can run a newer
+version than the template states (relay devnet: template 17.5, cluster
+17.9), which CloudFormation reports as drift. AuroraEngineVersion lets
+each deployment record the version its cluster reports. The default
+(17.5) keeps every existing deployment's template values unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ lib/sov-rollup-cdk-starter-stack.ts | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/lib/sov-rollup-cdk-starter-stack.ts b/lib/sov-rollup-cdk-starter-stack.ts
+index 90a0a66..e9ccaa2 100644
+--- a/lib/sov-rollup-cdk-starter-stack.ts
++++ b/lib/sov-rollup-cdk-starter-stack.ts
+@@ -554,10 +554,20 @@ export class SovRollupCdkStarterStack extends cdk.Stack {
+       rollupCommitHashParam.valueAsString
+     ).toString();
+ 
++    // Aurora applies minor upgrades automatically; set this to the version the
++    // cluster reports so the template matches it (no CloudFormation drift).
++    const auroraEngineVersionParam = new cdk.CfnParameter(this, 'AuroraEngineVersion', {
++      type: 'String',
++      description: 'Aurora PostgreSQL 17 engine version (e.g. 17.9), as reported by the running cluster',
++      allowedPattern: '^17\\.[0-9]+$',
++      default: '17.5'
++    });
++    const auroraEngineVersion = rds.AuroraPostgresEngineVersion.of(auroraEngineVersionParam.valueAsString, '17');
++
+     // Create Aurora postgres cluster. This gives multi-AZ durability by default and should perform better than managed postgres.
+     const mockDatabaseCluster = new rds.DatabaseCluster(this, 'SovRollupMockDatabaseCluster', {
+         engine: rds.DatabaseClusterEngine.auroraPostgres({
+-          version: rds.AuroraPostgresEngineVersion.VER_17_5
++          version: auroraEngineVersion
+         }),
+         vpc,
+         securityGroups: [rdsSecurityGroup],
+@@ -604,7 +614,7 @@ export class SovRollupCdkStarterStack extends cdk.Stack {
+     // Create Aurora postgres cluster. This gives multi-AZ durability by default and should perform better than managed postgres.
+     const auroraCluster = new rds.DatabaseCluster(this, 'SovRollupAuroraCluster', {
+       engine: rds.DatabaseClusterEngine.auroraPostgres({
+-        version: rds.AuroraPostgresEngineVersion.VER_17_5
++        version: auroraEngineVersion
+       }),
+       vpc,
+       securityGroups: [rdsSecurityGroup],
+-- 
+2.56.1
+

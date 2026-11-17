@@ -1,0 +1,207 @@
+From 1c653d894ae354d7f45e004553bb6d5d3f8e7e95 Mon Sep 17 00:00:00 2001
+From: auricom <27022259+auricom@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 16:43:39 +0100
+Subject: [PATCH 2/2] Add RollupNodeInstanceType for single-NVMe rollup nodes
+
+The rollup launch templates hard-coded c8gd.12xlarge and the RAID-0 disk
+profiles. RollupNodeInstanceType (c8gd.12xlarge | i8g.4xlarge) now sets
+the instance type of the primary, secondary and backup nodes and selects
+the matching layout: i8g.4xlarge uses the single-NVMe Ansible profiles
+(aws_single_nvme_ebs_logs, aws_ebs_backup_node_single_nvme) and gets a
+64 GiB gp3 logs volume on /dev/sdg. The default keeps existing
+deployments on c8gd.12xlarge with unchanged resolved resources.
+
+Also point the RestoreFromVolumeInstructions output at the restore
+script Ansible actually installs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ lib/compute-infrastructure.ts       | 39 ++++++++++++++++++++++-----
+ lib/sov-rollup-cdk-starter-stack.ts | 14 +++++++++-
+ test/rollup-node-hardware.test.ts   | 42 +++++++++++++++++++++++++++++
+ 3 files changed, 88 insertions(+), 7 deletions(-)
+ create mode 100644 test/rollup-node-hardware.test.ts
+
+diff --git a/lib/compute-infrastructure.ts b/lib/compute-infrastructure.ts
+index 7d1bf2f..0888ce4 100644
+--- a/lib/compute-infrastructure.ts
++++ b/lib/compute-infrastructure.ts
+@@ -23,6 +23,9 @@ import {
+ export const MAX_NODE_SETUP_TIME_MINUTES = 15;
+ export const MOCK_DATABASE_NAME = 'mock_da_postgres';
+ const ROLLUP_EBS_IOPS = 30000;
++// Logs volume of single-NVMe rollup nodes (journald + rollup logs); the
++// rollup-starter-ansible README suggests 64 GiB as a starting size.
++const ROLLUP_LOGS_VOLUME_GIB = 64;
+ 
+ function shellSingleQuote(value: string): string {
+   return `'${value.replace(/'/g, `'"'"'`)}'`;
+@@ -267,6 +270,7 @@ export interface ComputeInfrastructureProps {
+   // Ansible-pull configuration
+   dataAvailabilityRole: string; // Required: "celestia" or "mock_da"
+   nodeRole?: string; // Optional: Node role for ansible runtime_vars.yaml (default: "DbElected")
++  rollupNodeInstanceType: string; // 'c8gd.12xlarge' (RAID-0 over NVMe) or 'i8g.4xlarge' (single NVMe + EBS logs)
+   // Leader election timing (preferred sequencer with Postgres only).
+   // Leader election timing. Optional: when unset the key is omitted from
+   // runtime_vars.yaml and the rollup's built-in default applies.
+@@ -791,10 +795,19 @@ export class ComputeInfrastructure extends Construct {
+       // Consumed by run_ansible.sh rather than the renderer
+       ANSIBLE_BRANCH: ansibleBranch,
+     };
++    // Single-NVMe instances keep state on their only NVMe and logs on EBS
++    // (/dev/sdg); see the matching profiles in rollup-starter-ansible.
++    const singleNvme = new cdk.CfnCondition(this, 'RollupNodesSingleNvme', {
++      expression: cdk.Fn.conditionEquals(props.rollupNodeInstanceType, 'i8g.4xlarge'),
++    });
++    const nodeDiskProfile = cdk.Fn.conditionIf(singleNvme.logicalId, 'aws_single_nvme_ebs_logs', 'aws_raid_0').toString();
++    const backupDiskProfile = cdk.Fn.conditionIf(
++      singleNvme.logicalId, 'aws_ebs_backup_node_single_nvme', 'aws_ebs_backup_node_raid_0',
++    ).toString();
+     const runtimeConfigValues = {
+-      primary: { ...sharedRuntimeConfigValues, DISK_PROFILE: 'aws_raid_0', SEQUENCER_KIND: 'preferred' },
+-      secondary: { ...sharedRuntimeConfigValues, DISK_PROFILE: 'aws_raid_0', SEQUENCER_KIND: 'preferred' },
+-      backup: { ...sharedRuntimeConfigValues, DISK_PROFILE: 'aws_ebs_backup_node_raid_0', SEQUENCER_KIND: 'standard' },
++      primary: { ...sharedRuntimeConfigValues, DISK_PROFILE: nodeDiskProfile, SEQUENCER_KIND: 'preferred' },
++      secondary: { ...sharedRuntimeConfigValues, DISK_PROFILE: nodeDiskProfile, SEQUENCER_KIND: 'preferred' },
++      backup: { ...sharedRuntimeConfigValues, DISK_PROFILE: backupDiskProfile, SEQUENCER_KIND: 'standard' },
+     };
+ 
+     // With secrets externalized, the remaining configuration is plain data. It
+@@ -1303,7 +1316,7 @@ export class ComputeInfrastructure extends Construct {
+ 
+     // Create primary launch template
+     const launchTemplate = new ec2.LaunchTemplate(this, 'PrimaryLaunchTemplate', {
+-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.C8GD, ec2.InstanceSize.XLARGE12),
++      instanceType: new ec2.InstanceType(props.rollupNodeInstanceType),
+       machineImage: ec2.MachineImage.fromSsmParameter(
+         '/aws/service/canonical/ubuntu/server/noble/stable/current/arm64/hvm/ebs-gp3/ami-id',
+         {
+@@ -1328,7 +1341,7 @@ export class ComputeInfrastructure extends Construct {
+ 
+     // Create secondary launch template (without --is-primary flag)
+     const secondaryLaunchTemplate = new ec2.LaunchTemplate(this, 'SecondaryLaunchTemplate', {
+-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.C8GD, ec2.InstanceSize.XLARGE12),
++      instanceType: new ec2.InstanceType(props.rollupNodeInstanceType),
+       machineImage: ec2.MachineImage.fromSsmParameter(
+         '/aws/service/canonical/ubuntu/server/noble/stable/current/arm64/hvm/ebs-gp3/ami-id',
+         {
+@@ -1353,7 +1366,7 @@ export class ComputeInfrastructure extends Construct {
+ 
+     // Create backup node launch template (without a preferred sequencer)
+     const backupNodeLaunchTemplate = new ec2.LaunchTemplate(this, 'BackupNodeLaunchTemplate', {
+-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.C8GD, ec2.InstanceSize.XLARGE12),
++      instanceType: new ec2.InstanceType(props.rollupNodeInstanceType),
+       machineImage: ec2.MachineImage.fromSsmParameter(
+         '/aws/service/canonical/ubuntu/server/noble/stable/current/arm64/hvm/ebs-gp3/ami-id',
+         {
+@@ -1387,6 +1400,20 @@ export class ComputeInfrastructure extends Construct {
+       ]
+     });
+ 
++    // Logs volume for single-NVMe instances, resolved by Ansible from its
++    // /dev/sdg attachment name. Appended after the existing mappings.
++    const addSingleNvmeLogsVolume = (template: ec2.LaunchTemplate, index: number) =>
++      (template.node.defaultChild as ec2.CfnLaunchTemplate).addPropertyOverride(
++        `LaunchTemplateData.BlockDeviceMappings.${index}`,
++        cdk.Fn.conditionIf(singleNvme.logicalId, {
++          DeviceName: '/dev/sdg',
++          Ebs: { VolumeSize: ROLLUP_LOGS_VOLUME_GIB, VolumeType: 'gp3', Encrypted: true, DeleteOnTermination: true },
++        }, cdk.Aws.NO_VALUE),
++      );
++    addSingleNvmeLogsVolume(launchTemplate, 1);
++    addSingleNvmeLogsVolume(secondaryLaunchTemplate, 1);
++    addSingleNvmeLogsVolume(backupNodeLaunchTemplate, 2);
++
+     const availabilityZones = props.vpc.availabilityZones;
+     assert(availabilityZones.length >= 2, 'Must have at least 2 availability zones');
+     const primaryAz = availabilityZones[0]; // Use VPC's first AZ as primary
+diff --git a/lib/sov-rollup-cdk-starter-stack.ts b/lib/sov-rollup-cdk-starter-stack.ts
+index e9ccaa2..0c949df 100644
+--- a/lib/sov-rollup-cdk-starter-stack.ts
++++ b/lib/sov-rollup-cdk-starter-stack.ts
+@@ -366,6 +366,17 @@ export class SovRollupCdkStarterStack extends cdk.Stack {
+       allowedValues: ['celestia', 'mock_da']
+     });
+ 
++    // Instance type of the primary, secondary and backup rollup nodes. It also
++    // selects the disk layout: c8gd.12xlarge stripes two of its three NVMe
++    // drives (the third holds logs); i8g.4xlarge has a single NVMe and gets an
++    // EBS logs volume.
++    const rollupNodeInstanceTypeParam = new cdk.CfnParameter(this, 'RollupNodeInstanceType', {
++      type: 'String',
++      description: 'Instance type of the rollup nodes (primary, secondary, backup); selects the matching disk layout',
++      allowedValues: ['c8gd.12xlarge', 'i8g.4xlarge'],
++      default: 'c8gd.12xlarge'
++    });
++
+     const nodeRoleParam = new cdk.CfnParameter(this, 'NodeRole', {
+       type: 'String',
+       description: 'Node role for ansible runtime_vars.yaml (for rollup_node_role)',
+@@ -692,6 +703,7 @@ export class SovRollupCdkStarterStack extends cdk.Stack {
+       // Ansible-pull configuration
+       dataAvailabilityRole: dataAvailabilityRoleParam.valueAsString,
+       nodeRole: nodeRoleParam.valueAsString || undefined,
++      rollupNodeInstanceType: rollupNodeInstanceTypeParam.valueAsString,
+       leaderTimeoutMillis: leaderTimeoutMillisParam.valueAsString || undefined,
+       leaderGracePeriodMillis: leaderGracePeriodMillisParam.valueAsString || undefined,
+       leaderHeartbeatIntervalMillis: leaderHeartbeatIntervalMillisParam.valueAsString || undefined,
+@@ -1034,7 +1046,7 @@ exports.handler = async () => {
+     });
+ 
+     new cdk.CfnOutput(this, 'RestoreFromVolumeInstructions', {
+-      value: `SSH into instance, then run: sudo /tmp/restore-from-volume.sh <vol-id or snap-id>`,
++      value: `Connect with SSM Session Manager, then run as ubuntu: /home/ubuntu/restore-from-snapshot.sh <snap-id or vol-id>`,
+       description: 'Instructions to restore rollup data from EBS volume or snapshot'
+     });
+ 
+diff --git a/test/rollup-node-hardware.test.ts b/test/rollup-node-hardware.test.ts
+new file mode 100644
+index 0000000..1d0d7be
+--- /dev/null
++++ b/test/rollup-node-hardware.test.ts
+@@ -0,0 +1,42 @@
++import * as cdk from 'aws-cdk-lib';
++import { Template } from 'aws-cdk-lib/assertions';
++import { describe, expect, it } from 'vitest';
++import { SovRollupCdkStarterStack } from '../lib/sov-rollup-cdk-starter-stack';
++
++const template = Template.fromStack(new SovRollupCdkStarterStack(new cdk.App(), 'HardwareTestStack'));
++const resources = template.toJSON().Resources as Record<string, { Type: string; Properties: any }>;
++const rollupLaunchTemplates = Object.entries(resources).filter(
++  ([id, r]) => r.Type === 'AWS::EC2::LaunchTemplate' && /(Primary|Secondary|BackupNode)LaunchTemplate/.test(id),
++);
++const singleNvme = Object.keys(template.toJSON().Conditions).find(
++  (c) => c.startsWith('SovRollupComputeRollupNodesSingleNvme'),
++)!;
++
++describe('RollupNodeInstanceType', () => {
++  it('defaults to the c8gd.12xlarge RAID layout so existing deployments are unchanged', () => {
++    template.hasParameter('RollupNodeInstanceType', {
++      Default: 'c8gd.12xlarge',
++      AllowedValues: ['c8gd.12xlarge', 'i8g.4xlarge'],
++    });
++    template.hasCondition(singleNvme, {
++      'Fn::Equals': [{ Ref: 'RollupNodeInstanceType' }, 'i8g.4xlarge'],
++    });
++  });
++
++  it('drives the instance type of all three rollup launch templates', () => {
++    expect(rollupLaunchTemplates).toHaveLength(3);
++    for (const [, lt] of rollupLaunchTemplates) {
++      expect(lt.Properties.LaunchTemplateData.InstanceType).toEqual({ Ref: 'RollupNodeInstanceType' });
++    }
++  });
++
++  it('adds the /dev/sdg logs volume only on single-NVMe instances', () => {
++    for (const [, lt] of rollupLaunchTemplates) {
++      const mappings = lt.Properties.LaunchTemplateData.BlockDeviceMappings;
++      const logs = mappings[mappings.length - 1];
++      expect(logs['Fn::If'][0]).toEqual(singleNvme);
++      expect(logs['Fn::If'][1].DeviceName).toEqual('/dev/sdg');
++      expect(logs['Fn::If'][2]).toEqual({ Ref: 'AWS::NoValue' });
++    }
++  });
++});
+-- 
+2.56.1
+
