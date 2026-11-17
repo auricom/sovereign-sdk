@@ -51,18 +51,29 @@
 - A node that is still syncing returns non-200 on `/sequencer/ready`, so node-discovery keeps it out of read routing. Clients never see a stale node.
 - The backup node is a *standard* sequencer and isn't part of the election. Swapping it has no client impact.
 
-### 0.5 Strategy (one node at a time)
-For each node:
-1. Activate a new launch template version (i8g.4xlarge plus an EBS logs volume) and the single-NVMe `DISK_PROFILE`.
-2. Scale its ASG from 1 to 2. The new instance boots and Ansible sets up the single NVMe.
-3. Restore the latest backup snapshot onto it. It catches up and becomes ready, and the proxy adds it automatically.
-4. Detach the old instance from the ASG and stop rollup on it. For the leader, this is the failover.
-5. Let it run for a while, then terminate the old instance.
+### 0.5 Strategy
+1. **Change the CDK app and deploy once (§3).** The deploy creates new launch template versions (i8g.4xlarge plus an EBS logs volume) and new SSM values-document versions (single-NVMe `DISK_PROFILE`), and points the three ASGs at them. **Running rollup instances aren't touched:** their ASGs have no rolling-update policy, and nodes only read the SSM documents at boot.
+2. **Then, one node at a time (§4):**
+   1. Scale its ASG from 1 to 2. The new instance boots from the new template and Ansible sets up the single NVMe.
+   2. Restore the latest backup snapshot onto it. It catches up and becomes ready, and the proxy adds it automatically.
+   3. Detach the old instance with a desired-capacity decrement (back to 1) and stop rollup on it. For the leader, this is the failover.
+   4. Let it run for a while, then terminate the old instance.
 
 **Order: non-leader preferred node → leader preferred node → backup node.** The backup goes last so its snapshots stay the restore source for the first two.
 
-### 0.6 ⚠ CDK drift
-The CDK stack owns the launch templates and SSM documents changed here by hand. Running instances are never touched by a deploy: the ASGs have no rolling-update policy. **But the next `cdk deploy` that modifies those resources reverts them** (for example, bumping `RollupCommitHash` rewrites the values documents). The next launched node would then come up as c8gd.12xlarge, or with `aws_raid_0` on an i8g.4xlarge, which fails at boot with *"Not enough instance store disks for RAID"*. **Port the changes to the CDK code (§7) before the next deploy.** I couldn't find the CDK source repo in the Sovereign-Labs GitHub org; it may be private.
+### 0.6 No drift: what goes through CDK and what doesn't
+| Change | How | CloudFormation drift? |
+|---|---|---|
+| Instance type, block devices, `DISK_PROFILE` | **CDK code + `cdk deploy`** (§3) | None: the stack is the source |
+| ASG desired capacity 1 → 2 → 1 | `aws autoscaling` during §4. The ASGs carry `UpdatePolicy.AutoScalingScheduledAction.IgnoreUnmodifiedGroupSizeProperties: true`, so a deploy doesn't fight runtime scaling. Every swap ends back at the template value (1) | None once each swap is done. §5 checks the stack is `IN_SYNC` |
+| Suspended processes, scale-in protection, detach, terminate | `aws autoscaling` / `aws ec2` | Not stack properties, so no drift. Suspended processes are resumed in §5 |
+| Temporary restore volumes, new snapshots | Created and deleted by the stack's own scripts on the nodes | Not stack resources |
+
+**No launch template or SSM document is ever edited by hand.**
+
+- The CDK source isn't in any GitHub repo visible to this account (searched the `Sovereign-Labs` org and all `rollup-starter` branches), nor on this machine.
+- CloudTrail shows every deploy is done by the IAM user **`aws-cdk-gentoo`**: the last ones were 2026-10-29, 2026-10-30 and 2026-11-09, all with CDK `2.220.0`. **§3 has to be run by that person, from the CDK repo.**
+- The stack's own node-level config-drift check (`SovRollupCdkStarterStack-runtime-config-drift` alarm) **will fire** between the deploy and the last swap. The old nodes run a configuration that no longer matches the stack. It clears once the old nodes are gone.
 
 ---
 
@@ -74,8 +85,9 @@ export RO=ReadOnlyAccess-313110633477           # read-only checks
 export RW=<profile with write access to 313110633477>   # [write] steps
 export DOMAIN=relay-devnet.sovereign-labs.xyz
 export API=12346
-export LT_BASE=44                               # current latest version of the 3 launch templates
-export DOC_BASE=10                              # current default version of the 3 values documents
+export LT_BASE=44                               # latest version of the 3 launch templates before the deploy
+export DOC_BASE=10                              # default version of the 3 values documents before the deploy
+export STACK=SovRollupCdkStarterStack
 export LOG=~/i8g-migration-relay-devnet.env     # every ID created is appended here
 
 export P_ASG=SovRollupCdkStarterStack-SovRollupComputePrimaryAsgASG448C4328-fVa4yPZ43E36
@@ -144,20 +156,115 @@ aws --profile $RO ec2 describe-snapshots --owner-ids self \
 ```
 The latest `completed` snapshot must be < 2 h old. On the backup node: `sudo tail -40 /mnt/logs/rollup-snapshot.log` should show `=== Snapshot complete ===` every hour, with no `ERROR`.
 
-### 2.6 Freeze
+### 2.6 Drift baseline: the stack must be in sync before we start
+```bash
+DID=$(aws --profile $RO cloudformation detect-stack-drift --stack-name $STACK --query StackDriftDetectionId --output text)
+sleep 60; aws --profile $RO cloudformation describe-stack-drift-detection-status --stack-drift-detection-id $DID \
+  --query '[DetectionStatus,StackDriftStatus,DriftedStackResourceCount]' --output text
+aws --profile $RO cloudformation describe-stack-resource-drifts --stack-name $STACK --stack-resource-drift-status-filters MODIFIED DELETED \
+  --query 'StackResourceDrifts[].[LogicalResourceId,ResourceType,PropertyDifferences[].PropertyPath|join(`,`,@)]' --output table
+```
+Expect `DETECTION_COMPLETE  IN_SYNC  0`. If anything is already drifted, sort it out with the CDK owner first: either fix it in code or revert it by hand. Otherwise the deploy in §3 will silently overwrite it.
+
+**Result on 2026-11-17: `DRIFTED 1`.** `SovRollupAuroraClusterC528DD46` (`AWS::RDS::DBCluster`) has `/EngineVersion` expected `17.5`, actual `17.9`. Aurora applied an automatic minor version upgrade. Fix it in the CDK code **in a separate deploy before §3**, so the migration change set only contains migration changes:
+- set the cluster engine to `rds.AuroraPostgresEngineVersion.of('17.9', '17')` (or whatever version `aws rds describe-db-clusters --query 'DBClusters[].EngineVersion'` reports on the day);
+- preview it like §3.3. The change set must show only `Modify SovRollupAuroraClusterC528DD46` with `Replacement False`, because the version already matches;
+- execute it, then re-run the drift detection above until it reports `IN_SYNC 0`.
+
+To stop this from recurring, either pin `autoMinorVersionUpgrade: false` on the cluster instances, or accept that each AWS minor upgrade needs a follow-up one-line CDK bump. If the read-only profile can't call `detect-stack-drift`, run these three commands with `$RW`; drift detection doesn't modify anything.
+
+### 2.7 Freeze
 Until §5 is done, don't do any of the following:
-- `cdk deploy` on `SovRollupCdkStarterStack`
+- any `cdk deploy` other than the one in §3
 - the stack's `MigrateLiveNodesCommand`
-- `render_config.sh` / `run_ansible.sh` on the old nodes. They would read the new single-NVMe `DISK_PROFILE`, and Ansible would fail on hardware that doesn't match it.
+- `render_config.sh` / `run_ansible.sh` on the old nodes. After §3 they would read the new single-NVMe `DISK_PROFILE`, and Ansible would fail on hardware that doesn't match it.
 
 Tell dev users when the leader swap (a few seconds of write pause) will happen.
 
 ---
 
-## 3. One-time preparation **[write]**
+## 3. Change the CDK app and deploy once **[write, run by the CDK owner]**
 
-### 3.1 Stop the ASGs from replacing instances on their own
-The instance role can call `autoscaling:SetInstanceHealth`, so something on the nodes may mark an instance unhealthy. The ASG would then terminate it, possibly halfway through a restore.
+### 3.1 Start from what's deployed
+In the CDK repo, on the machine and credentials normally used for deploys (CloudTrail user `aws-cdk-gentoo`):
+```bash
+git status && git log -1 --oneline        # clean tree, the commit that was deployed on 2026-11-09
+npm ci
+npx cdk --version                         # deployed with 2.220.0; same or newer
+npx cdk diff SovRollupCdkStarterStack     # BEFORE editing: must print no differences
+```
+If `cdk diff` already shows differences, the code doesn't match the deployed stack. Reconcile that first, otherwise this deploy also ships changes nobody reviewed.
+
+### 3.2 Code changes
+Find the places to change:
+```bash
+grep -rnE "c8gd|C8GD|aws_raid_0|aws_ebs_backup_node_raid_0|/dev/sdf|DISK_PROFILE|diskProfile|restore-from-volume" --include='*.ts' bin lib
+```
+1. **Primary, Secondary and BackupNode launch templates:** set `instanceType: new ec2.InstanceType('i8g.4xlarge')`.
+2. **Same three templates:** add a logs volume on `/dev/sdg`. That's the device name `aws_single_nvme_ebs_logs` and `aws_ebs_backup_node_single_nvme` look for. Keep the existing root volume, and keep `/dev/sdf` on the backup unchanged:
+   ```ts
+   { deviceName: '/dev/sdg',
+     volume: ec2.BlockDeviceVolume.ebs(200 /* LOGS_GB from §2.3 */, {
+       volumeType: ec2.EbsDeviceVolumeType.GP3, encrypted: true, deleteOnTermination: true }) },
+   ```
+3. **Runtime values documents:** set `DISK_PROFILE` to `aws_single_nvme_ebs_logs` for primary and secondary, and `aws_ebs_backup_node_single_nvme` for backup. Both profiles exist in `rollup-starter-ansible@cdk-deployment-october-2026` (`roles/common/defaults/main.yaml`); the backup profile requires `SEQUENCER_KIND=standard`, which the backup already uses.
+4. Optional, same deploy: fix the `RestoreFromVolumeInstructions` output. The script is `/home/ubuntu/restore-from-snapshot.sh <snap-id>`, not `/tmp/restore-from-volume.sh`.
+
+Commit the change on a branch and get it reviewed like any infra change.
+
+### 3.3 Preview the exact change set (nothing is applied)
+```bash
+npx cdk diff SovRollupCdkStarterStack
+npx cdk deploy SovRollupCdkStarterStack --no-execute --change-set-name i8g-4xlarge-migration
+aws cloudformation describe-change-set --stack-name $STACK --change-set-name i8g-4xlarge-migration \
+  --query 'Changes[].ResourceChange.{action:Action,id:LogicalResourceId,type:ResourceType,replacement:Replacement,scope:join(`,`,Scope)}' --output table
+```
+Expected rows, all `Modify` with `Replacement = False`:
+
+| Resource | Why |
+|---|---|
+| `SovRollupComputePrimaryLaunchTemplate…`, `…SecondaryLaunchTemplate…`, `…BackupNodeLaunchTemplate…` | instance type, `/dev/sdg`, and a newer Ubuntu arm64 AMI (`ami-0f6435163a86ffc8c` instead of `ami-09a93d801db0bafae`). The AMI comes from the stack's SSM parameter and changes at every deploy |
+| `SovRollupComputePrimaryAsg…`, `…SecondaryAsg…`, `…BackupNodeAsg…` | `LaunchTemplate.Version`. No rolling-update policy, so **no instance is replaced** |
+| `SovRollupComputeRuntimeConfigValuesPrimary…`, `…Secondary…`, `…Backup…` | `DISK_PROFILE`. `UpdateMethod: NewVersion` creates version 11 and makes it the default |
+| `SovRollupComputeProxyLaunchTemplate…` + `SovRollupComputeProxyAsg…` | **Not from our change.** The Ubuntu amd64 AMI parameter now resolves to `ami-08b275ac6cc5dbefb` (deployed: `ami-0d6dd9e8265d48906`). The proxy ASG has a rolling-update policy (`MinInstancesInService 1`, waits for the new proxy's signal, 30 min max), so the deploy **replaces the proxy instance one for one**. Every recent deploy did this (CloudTrail `SignalResource` after each one) |
+
+**Stop and don't execute** if the change set shows anything else: any `Replacement: True`, any `Remove`, Aurora / EIP / VPC / security group / IAM changes, or changes to `MinSize`/`MaxSize`/`DesiredCapacity`. Drop it with `aws cloudformation delete-change-set --stack-name $STACK --change-set-name i8g-4xlarge-migration`.
+
+### 3.4 Deploy
+Run at a quiet time because of the proxy roll, and execute **the change set you reviewed**:
+```bash
+aws cloudformation execute-change-set --stack-name $STACK --change-set-name i8g-4xlarge-migration
+aws cloudformation wait stack-update-complete --stack-name $STACK
+aws cloudformation describe-stack-events --stack-name $STACK --max-items 40 \
+  --query 'StackEvents[].[Timestamp,LogicalResourceId,ResourceStatus,ResourceStatusReason]' --output table
+```
+During the proxy roll, run the write probe from §4.5 against `https://$DOMAIN/sequencer/ready`.
+
+### 3.5 Check the result (read-only)
+```bash
+aws --profile $RO ec2 describe-launch-templates --launch-template-ids $P_LT $S_LT $B_LT --query 'LaunchTemplates[].[LaunchTemplateId,LatestVersionNumber]' --output text
+for lt in $P_LT $S_LT $B_LT; do
+  aws --profile $RO ec2 describe-launch-template-versions --launch-template-id $lt --versions '$Latest' \
+    --query 'LaunchTemplateVersions[0].[LaunchTemplateId,VersionNumber,LaunchTemplateData.InstanceType,join(`,`,LaunchTemplateData.BlockDeviceMappings[].DeviceName)]' --output text
+done                                  # i8g.4xlarge, /dev/sda1,/dev/sdg (backup: + /dev/sdf)
+aws --profile $RO autoscaling describe-auto-scaling-groups --auto-scaling-group-names $P_ASG $S_ASG $B_ASG \
+  --query 'AutoScalingGroups[].[AutoScalingGroupName,LaunchTemplate.Version,DesiredCapacity,Instances[0].InstanceId,Instances[0].LaunchTemplate.Version]' --output text
+                                      # ASG version = latest; instances still the old ones (v39), desired 1
+for d in $P_DOC $S_DOC $B_DOC; do printf '%s: ' $d
+  aws --profile $RO ssm get-document --name $d --query Content --output text | jq -r '.mainSteps[0].inputs.runCommand[]' \
+    | grep '^DISK_PROFILE=' | sed -E "s/.*'([^']+)'.*/\1/" | base64 -d; echo
+done
+```
+Record the new versions: `echo "P_LTV=<n> S_LTV=<n> B_LTV=<n>" | tee -a $LOG`. Then repeat the drift check from §2.6: it must still be `IN_SYNC`.
+
+From now on, any instance launched by these ASGs is an i8g.4xlarge with the single-NVMe layout, including an unplanned replacement.
+
+---
+
+## 4. Per-node procedure
+
+### 4.0 Before the first node: stop the ASGs from replacing instances on their own **[write]**
+The instance role can call `autoscaling:SetInstanceHealth`, so something on the nodes may mark an instance unhealthy. The ASG would then terminate it, possibly halfway through a restore. Suspended processes aren't a stack property, so this causes no drift; they're resumed in §5.
 ```bash
 for g in $P_ASG $S_ASG $B_ASG; do
   aws --profile $RW autoscaling suspend-processes --auto-scaling-group-name $g --scaling-processes ReplaceUnhealthy AZRebalance
@@ -165,75 +272,18 @@ done
 aws --profile $RO autoscaling describe-auto-scaling-groups --auto-scaling-group-names $P_ASG $S_ASG $B_ASG --query 'AutoScalingGroups[].SuspendedProcesses[].ProcessName'
 ```
 
-### 3.2 New launch template versions (not used until §4.1)
-`--source-version 44` copies everything: AMI, user data, SG, instance profile and key pair. Fields given in `--launch-template-data` replace the source's. **`BlockDeviceMappings` is replaced as a whole**, so the root volume (and `/dev/sdf` on the backup) must be repeated.
-```bash
-LOGS_GB=200
-ROOT='{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":64,"VolumeType":"gp3"}}'
-LOGS='{"DeviceName":"/dev/sdg","Ebs":{"VolumeSize":'$LOGS_GB',"VolumeType":"gp3","Encrypted":true,"DeleteOnTermination":true}}'
-SNAP='{"DeviceName":"/dev/sdf","Ebs":{"VolumeSize":1800,"VolumeType":"gp3","Iops":30000,"Throughput":1000,"Encrypted":true,"DeleteOnTermination":true}}'
-newver() {  # $1 = template id, $2 = block device mappings, extra args (e.g. --dry-run)
-  aws --profile $RW ec2 create-launch-template-version "${@:3}" --launch-template-id "$1" --source-version $LT_BASE \
-    --version-description "i8g.4xlarge single-NVMe migration" \
-    --launch-template-data "{\"InstanceType\":\"i8g.4xlarge\",\"BlockDeviceMappings\":[$2]}" \
-    --query LaunchTemplateVersion.VersionNumber --output text
-}
-newver $P_LT "$ROOT,$LOGS" --dry-run; newver $S_LT "$ROOT,$LOGS" --dry-run; newver $B_LT "$ROOT,$SNAP,$LOGS" --dry-run
-P_LTV=$(newver $P_LT "$ROOT,$LOGS"); S_LTV=$(newver $S_LT "$ROOT,$LOGS"); B_LTV=$(newver $B_LT "$ROOT,$SNAP,$LOGS")
-echo "P_LTV=$P_LTV S_LTV=$S_LTV B_LTV=$B_LTV" | tee -a $LOG
-```
-Check that only `InstanceType` and `BlockDeviceMappings` changed:
-```bash
-for x in "$P_LT $P_LTV" "$S_LT $S_LTV" "$B_LT $B_LTV"; do set -- $x
-  diff <(aws --profile $RO ec2 describe-launch-template-versions --launch-template-id $1 --versions $LT_BASE --query 'LaunchTemplateVersions[0].LaunchTemplateData' | jq -S 'del(.InstanceType,.BlockDeviceMappings)') \
-       <(aws --profile $RO ec2 describe-launch-template-versions --launch-template-id $1 --versions $2       --query 'LaunchTemplateVersions[0].LaunchTemplateData' | jq -S 'del(.InstanceType,.BlockDeviceMappings)') \
-  && echo "$1 v$2: only type + disks changed"
-done
-```
-Creating a version doesn't change anything yet: the ASGs still point at v44.
-
-### 3.3 Prepare the new values documents (activated in §4.1)
-The values documents store each value base64-encoded: `DISK_PROFILE=$(printf '%s' '<base64>' | base64 -d)`.
-
-| Node | Old profile (base64) | New profile (base64) |
-|---|---|---|
-| primary, secondary | `aws_raid_0` (`YXdzX3JhaWRfMA==`) | `aws_single_nvme_ebs_logs` (`YXdzX3NpbmdsZV9udm1lX2Vic19sb2dz`): NVMe → `/mnt/rollup`, EBS `/dev/sdg` → `/mnt/logs` |
-| backup | `aws_ebs_backup_node_raid_0` (`YXdzX2Vic19iYWNrdXBfbm9kZV9yYWlkXzA=`) | `aws_ebs_backup_node_single_nvme` (`YXdzX2Vic19iYWNrdXBfbm9kZV9zaW5nbGVfbnZtZQ==`): plus EBS `/dev/sdf` → `/mnt/snapshots` and the hourly snapshot cron |
-
-```bash
-mkdoc() {  # $1 = document, $2 = old profile, $3 = new profile
-  aws --profile $RO ssm get-document --name $1 --document-version $DOC_BASE --document-format JSON --query Content --output text > /tmp/$1.v$DOC_BASE.json
-  old=$(printf '%s' "$2" | base64 -w0); new=$(printf '%s' "$3" | base64 -w0)
-  [ "$(grep -cF "'$old'" /tmp/$1.v$DOC_BASE.json)" = 1 ] || { echo "STOP: '$old' not found exactly once in $1"; return 1; }
-  sed "s|'$old'|'$new'|" /tmp/$1.v$DOC_BASE.json > /tmp/$1.new.json
-  diff <(jq . /tmp/$1.v$DOC_BASE.json) <(jq . /tmp/$1.new.json)      # exactly one line: the DISK_PROFILE line
-}
-mkdoc $P_DOC aws_raid_0 aws_single_nvme_ebs_logs
-mkdoc $S_DOC aws_raid_0 aws_single_nvme_ebs_logs
-mkdoc $B_DOC aws_ebs_backup_node_raid_0 aws_ebs_backup_node_single_nvme
-```
-
----
-
-## 4. Per-node procedure
-
 Run §4.1–§4.7 three times, finishing each node before starting the next:
 
 | Run | Node | Variables |
 |---|---|---|
-| 1 | the **non-leader** from §2.2 | `N=S ASG=$S_ASG LT=$S_LT LTV=$S_LTV DOC=$S_DOC OLD=$S_OLD` (or the `P_` set if the secondary leads) |
+| 1 | the **non-leader** from §2.2 | `N=S ASG=$S_ASG LTV=$S_LTV OLD=$S_OLD` (or the `P_` set if the secondary leads) |
 | 2 | the **leader** | the other `P_` / `S_` set |
-| 3 | **backup** | `N=B ASG=$B_ASG LT=$B_LT LTV=$B_LTV DOC=$B_DOC OLD=$B_OLD` |
+| 3 | **backup** | `N=B ASG=$B_ASG LTV=$B_LTV OLD=$B_OLD` |
 
-### 4.1 Activate the new template and disk profile **[write]**
+### 4.1 Confirm the ASG launches the new template
 ```bash
-DOCV=$(aws --profile $RW ssm update-document --name $DOC --content file:///tmp/$DOC.new.json --document-format JSON \
-  --document-version '$LATEST' --query DocumentDescription.LatestVersion --output text); echo "${N}_DOCV=$DOCV" | tee -a $LOG
-aws --profile $RW ssm update-document-default-version --name $DOC --document-version $DOCV
-aws --profile $RW autoscaling update-auto-scaling-group --auto-scaling-group-name $ASG --launch-template LaunchTemplateId=$LT,Version=$LTV
-# check
-aws --profile $RO ssm get-document --name $DOC --document-format JSON --query Content --output text | grep -o "DISK_PROFILE=[^|]*"
-aws --profile $RO autoscaling describe-auto-scaling-groups --auto-scaling-group-names $ASG --query 'AutoScalingGroups[0].LaunchTemplate'
+aws --profile $RO autoscaling describe-auto-scaling-groups --auto-scaling-group-names $ASG \
+  --query 'AutoScalingGroups[0].[LaunchTemplate.Version,DesiredCapacity,length(Instances)]' --output text   # $LTV  1  1
 ```
 
 ### 4.2 Launch the new instance **[write]**
@@ -265,7 +315,7 @@ grep -E '^(disk_profile|rollup_node_role|rollup_sequencer_kind|rollup_commit_has
 systemctl is-active rollup                         # active: syncing from the DA start height on an empty disk
 curl -s -o /dev/null -w 'ready=%{http_code}\n' localhost:12346/sequencer/ready   # not 200, so not routed by the proxy
 ```
-If the bootstrap failed, the last Ansible task in the log explains why. The usual cause is *"Not enough instance store disks for RAID"*: the new `DISK_PROFILE` wasn't active, so redo §4.1. To discard the instance, remove its protection (`set-instance-protection --no-protected-from-scale-in`), then run `aws --profile $RW autoscaling terminate-instance-in-auto-scaling-group --instance-id $NEW --should-decrement-desired-capacity`.
+If the bootstrap failed, the last Ansible task in the log explains why. The usual cause is *"Not enough instance store disks for RAID"*: the instance read the old `DISK_PROFILE`, meaning the deploy in §3 didn't take effect. Re-check §3.5. To discard the instance, remove its protection (`set-instance-protection --no-protected-from-scale-in`), then run `aws --profile $RW autoscaling terminate-instance-in-auto-scaling-group --instance-id $NEW --should-decrement-desired-capacity`.
 
 Primary and secondary nodes are `DbElected`. Until the restore is done, make sure the current leader stays up, because this node isn't caught up yet.
 
@@ -294,7 +344,7 @@ Allow about 1–1.5 h for 944 GB. The log is in `/mnt/logs/rollup-restore.log`. 
 
 If it stops halfway, its exit trap detaches and deletes the temporary volume. Check for leftovers with `aws --profile $RO ec2 describe-volumes --filters Name=tag:Purpose,Values=restore-temp --query 'Volumes[].[VolumeId,State]'`, then re-run.
 
-The stack output `RestoreFromVolumeInstructions` points at `/tmp/restore-from-volume.sh`. That path is out of date: the script lives at `/home/ubuntu/restore-from-snapshot.sh`.
+Unless it was fixed in §3.2, the stack output `RestoreFromVolumeInstructions` still points at `/tmp/restore-from-volume.sh`. That path is out of date: the script lives at `/home/ubuntu/restore-from-snapshot.sh`.
 
 ### 4.5 Catch-up checks
 On `$NEW`:
@@ -369,33 +419,30 @@ aws --profile $RO ec2 describe-instances --filters Name=tag:Stack,Values=SovRoll
 - **Proxy static fallback:** `backend-select.lua` has the leader/follower IPs baked in at render time. They're used only before node-discovery's first update. On the proxy, run `sudo grep -rnE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:12346' /etc/openresty /usr/local/openresty 2>/dev/null`. If it still shows `10.0.2.21` / `10.0.3.143`, refresh the proxy config the way the proxy is normally re-rendered.
 - **Alarms:** check that `SovRollupCdkStarterStack-health-check-failure` and `SovRollupCdkStarterStack-runtime-config-drift` are back to OK.
 - **Old snapshots:** once the old backup is terminated, its snapshots on `vol-0b7f605d6d0900a4a` are no longer pruned. The same applies to the September snapshots of `vol-03be4d7901208fbe7` already in the account. Delete them when you no longer need them: `aws ec2 delete-snapshot --snapshot-id …`.
+- **The stack ends without drift:** repeat the §2.6 drift detection. It must report `IN_SYNC 0`; in particular every ASG must be back to `DesiredCapacity 1`.
 - Keep `$LOG`.
 
 ---
 
 ## 6. Rollback
+Configuration rollbacks also go through CDK. **Never edit a launch template, an ASG launch template version or an SSM document by hand.**
 
 | When | Action |
 |---|---|
-| Before §4.6 for a node | Remove the new instance: `set-instance-protection --no-protected-from-scale-in`, then `terminate-instance-in-auto-scaling-group --instance-id $NEW --should-decrement-desired-capacity`. Point the ASG back to v44: `update-auto-scaling-group --launch-template LaunchTemplateId=$LT,Version=$LT_BASE`. Restore the document: `update-document-default-version --name $DOC --document-version $DOC_BASE`. The old node was never touched. |
+| Change set (§3.3) looks wrong | `aws cloudformation delete-change-set --stack-name $STACK --change-set-name i8g-4xlarge-migration`. Nothing was applied. |
+| Deploy (§3.4) fails | CloudFormation rolls the stack back by itself (`UPDATE_ROLLBACK_COMPLETE`). Check with `describe-stack-events`, fix the code, and redo §3.3. |
+| Before §4.6 for a node | Remove the new instance: `set-instance-protection --no-protected-from-scale-in`, then `terminate-instance-in-auto-scaling-group --instance-id $NEW --should-decrement-desired-capacity`. The old node was never touched. To abandon the whole migration, also `git revert` the CDK commit and deploy it through a reviewed change set (§3.3–§3.4). The ASGs then launch c8gd.12xlarge with the RAID profiles again. |
 | After §4.6, before §4.7 | On `$OLD`: `sudo systemctl unmask rollup && sudo systemctl enable --now rollup`. It rejoins as a `DbElected` replica; wait for `ready=200`. Re-attach it: `aws autoscaling attach-instances --auto-scaling-group-name $ASG --instance-ids $OLD` (max size allows 2). Then handle the new instance as in the first row. For the backup, also restore the old cron line: `0 * * * * /home/ubuntu/snapshot-rollup-data.sh` in `crontab -u ubuntu`. |
 | New leader crash-looping after run 2 | In sessions on both new preferred nodes: `sudo systemctl disable --now rollup && sudo systemctl mask rollup`. Then on the old leader: `sudo systemctl unmask rollup && sudo systemctl enable --now rollup`. It's `DbElected` and takes leadership about 1 s after the others stop heartbeating. Diagnose with `journalctl -u rollup`, `journalctl -k \| grep -i oom`, `df -h`. |
 
 ---
 
-## 7. Port the changes to the CDK code (before the next `cdk deploy`)
-- `PrimaryLaunchTemplate`, `SecondaryLaunchTemplate`, `BackupNodeLaunchTemplate`: `instanceType` → `i8g.4xlarge`. Add the `/dev/sdg` gp3 logs volume (`LOGS_GB`, encrypted, delete on termination). Keep `/dev/sdf` on the backup.
-- Runtime config values: `DISK_PROFILE` = `aws_single_nvme_ebs_logs` for primary and secondary, `aws_ebs_backup_node_single_nvme` for backup.
-- Fix the `RestoreFromVolumeInstructions` output (`/home/ubuntu/restore-from-snapshot.sh <snap-id>`).
-- `cdk diff` should show only these changes: 3 launch templates, 3 ASG `LaunchTemplate.Version` values, 3 SSM documents. It must not show any instance replacement.
-
----
-
-## 8. Time estimate
+## 7. Time estimate
 
 | Step | Duration |
 |---|---|
-| §2 pre-flight + §3 preparation | 1 h |
+| §2 pre-flight, incl. the Aurora drift fix deploy (§2.6) | 1–2 h |
+| §3 CDK change, review, change set, deploy (incl. proxy roll) | 1–2 h + review time |
 | Per node: bootstrap (§4.3) | 30–90 min |
 | Per node: snapshot restore (§4.4) | 1–1.5 h |
 | Per node: catch-up + soak (§4.5) | 24 h (run 1), ≥ 2 h (runs 2, 3) |
@@ -407,4 +454,4 @@ aws --profile $RO ec2 describe-instances --filters Name=tag:Stack,Values=SovRoll
 - On each node, `/mnt/rollup` is on the single instance-store NVMe (no md device) and `/mnt/logs` is on EBS `/dev/sdg`. The backup also has `/mnt/snapshots` on EBS `/dev/sdf`, and new hourly snapshots of its new volume complete.
 - One new preferred node is leader. Both preferred nodes return `ready=200`, have the same height and the same state roots. `https://relay-devnet.sovereign-labs.xyz` serves reads and writes. The only client-visible impact was the leader failover pause.
 - The old c8gd.12xlarge instances are terminated, with no orphaned volumes, and the alarms are OK.
-- The CDK code has been updated (§7), so the next `cdk deploy` doesn't revert the change.
+- The CDK repo holds the change (instance type, `/dev/sdg`, `DISK_PROFILE`). `cdk diff` on its main branch prints no differences, and CloudFormation drift detection reports `IN_SYNC`.
