@@ -8,19 +8,7 @@
 
 ## 0. What the account really contains
 
-### 0.1 Corrections to the earlier version of this runbook
-
-| Earlier assumption | What the account shows |
-|---|---|
-| Current type i8g.12xlarge | **c8gd.12xlarge**: 48 vCPU, **96 GiB** RAM, **3 × 950 GB** NVMe |
-| Instances created by hand, no IaC | AWS **CDK / CloudFormation stack `SovRollupCdkStarterStack`**. Each node is the single instance of its own **Auto Scaling group** (min 1 / desired 1), launched from a launch template |
-| RAID built by hand | Built at boot by **Ansible** (`Sovereign-Labs/rollup-starter-ansible`, branch `cdk-deployment-october-2026`, `roles/common/tasks/disks.yaml`) run via `ansible-pull` from user data. The layout comes from `DISK_PROFILE` in an SSM document. **Single-NVMe profiles already exist in that branch**, so no Ansible code changes are needed |
-| Snapshot format unknown | Every hour the backup node stops rollup, rsyncs `/mnt/rollup` to an EBS volume on `/dev/sdf` and takes an **EBS snapshot** (retention ≈ 0 h / 6 h / 1 d / 1 w / 1 mo). Every node already has the restore script **`/home/ubuntu/restore-from-snapshot.sh <snap-id>`** |
-| Write routing unknown | The proxy (t3.small, EIP `44.193.19.138`, `relay-devnet.sovereign-labs.xyz`) runs **node-discovery** against Postgres. Writes go to the leader. Reads go only to followers whose `/sequencer/ready` returns 200. **Nothing to switch by hand** |
-| Postgres somewhere | **Aurora PostgreSQL 17.9**: writer in us-east-1a, reader in us-east-1b (db.r8g.large) |
-| Node IDs set by hand | `rollup_node_id` = **EC2 instance ID**, set automatically by the render script |
-
-### 0.2 Inventory
+### 0.1 Inventory
 
 | Role | ASG (`desired/min/max`) | Instance | AZ / IP | Launch template | `DISK_PROFILE` today | Sequencer | Election role |
 |---|---|---|---|---|---|---|---|
@@ -33,7 +21,7 @@
 - Today's `aws_raid_0` layout: NVMe 1 + 2 in RAID0 at `/mnt/rollup` (ext4, 1.9 TB), NVMe 3 at `/mnt/logs`. The backup node also has EBS `/dev/sdf` (`vol-0b7f605d6d0900a4a`, 1800 GiB gp3, 30k IOPS) at `/mnt/snapshots`.
 - Launch template **v44** (the ASGs' current version) differs from **v39** (what the running instances booted from) only in the AMI (`ami-09a93d801db0bafae`, Ubuntu 24.04 arm64) and the Ansible branch (`cdk-deployment-june-2026` → `cdk-deployment-october-2026`).
 
-### 0.3 Sizing check: GO
+### 0.2 Sizing check: GO
 
 | | c8gd.12xlarge (today) | i8g.4xlarge (target) | Verdict |
 |---|---|---|---|
@@ -44,14 +32,14 @@
 | Capacity | – | i8g.4xlarge offered in us-east-1a/b/c/d | **OK** |
 | vCPU quota | 512 | +16 during each swap (peak 162) | **OK** |
 
-### 0.4 How the no-downtime switch works (SDK behaviour)
+### 0.3 How the no-downtime switch works (SDK behaviour)
 - Primary and secondary run with `node_role = "DbElected"` and leader election in Aurora (`leader_timeout` 1 s, `grace_period` 10 s, `heartbeat` 100 ms, which are the defaults because the CDK parameters are empty).
 - A `DbElected` node that isn't leader runs as a Postgres-synced replica. When the leader stops heart-beating for > 1 s, a replica takes leadership, **exits**, and is restarted by systemd as the batch producer. `rollup.service` has `Restart=always`, `RestartSec=3`.
 - **Reads** never stop. **Writes** pause for about 1 s plus the restart time when the leader node is retired (§4.6).
 - A node that is still syncing returns non-200 on `/sequencer/ready`, so node-discovery keeps it out of read routing. Clients never see a stale node.
 - The backup node is a *standard* sequencer and isn't part of the election. Swapping it has no client impact.
 
-### 0.5 Strategy
+### 0.4 Strategy
 1. **Change the CDK app and deploy once (§3).** The deploy creates new launch template versions (i8g.4xlarge plus an EBS logs volume) and new SSM values-document versions (single-NVMe `DISK_PROFILE`), and points the three ASGs at them. **Running rollup instances aren't touched:** their ASGs have no rolling-update policy, and nodes only read the SSM documents at boot.
 2. **Then, one node at a time (§4):**
    1. Scale its ASG from 1 to 2. The new instance boots from the new template and Ansible sets up the single NVMe.
@@ -61,7 +49,7 @@
 
 **Order: non-leader preferred node → leader preferred node → backup node.** The backup goes last so its snapshots stay the restore source for the first two.
 
-### 0.6 No drift: what goes through CDK and what doesn't
+### 0.5 No drift: what goes through CDK and what doesn't
 | Change | How | CloudFormation drift? |
 |---|---|---|
 | Instance type, block devices, `DISK_PROFILE` | **CDK code + `cdk deploy`** (§3) | None: the stack is the source |
@@ -75,7 +63,7 @@
 - CloudTrail shows every deploy is done by the IAM user **`aws-cdk-gentoo`**: the last ones were 2026-10-29, 2026-10-30 and 2026-11-09, all with CDK `2.220.0`. **§3 has to be run by that person, from the CDK repo.**
 - The stack's own node-level config-drift check (`SovRollupCdkStarterStack-runtime-config-drift` alarm) **will fire** between the deploy and the last swap. The old nodes run a configuration that no longer matches the stack. It clears once the old nodes are gone.
 
-### 0.7 How a new i8g.4xlarge instance gets installed (no Ansible change needed)
+### 0.6 How a new i8g.4xlarge instance gets installed (no Ansible change needed)
 The single-NVMe support already exists in the Ansible branch the new instances boot from. It was added upstream by `rollup-starter-ansible` commit `e47315fb34` (2026-10-05, *"Rework EBS disk detection and add support for EBS log volume"*), and that branch's README documents it for single-NVMe instances. This migration only has to **select** it, through CDK (§3).
 
 Boot chain, from launch template user data:
@@ -155,7 +143,7 @@ aws --profile $RO ec2 describe-launch-templates --launch-template-ids $P_LT $S_L
 for d in $P_DOC $S_DOC $B_DOC; do aws --profile $RO ssm describe-document --name $d --query 'Document.[Name,DefaultVersion]' --output text; done   # all 10
 aws --profile $RO cloudformation describe-stacks --stack-name SovRollupCdkStarterStack --query 'Stacks[0].[StackStatus,LastUpdatedTime]' --output text
 ```
-If any value differs (someone deployed), update `LT_BASE` / `DOC_BASE` and re-read §0.2.
+If any value differs (someone deployed), update `LT_BASE` / `DOC_BASE` and re-read §0.1.
 
 ### 2.2 Which node is the leader
 Open a session on each preferred node (`aws --profile $RW ssm start-session --target $P_OLD`, then `$S_OLD`) and run:
@@ -410,7 +398,7 @@ while true; do printf '%s ' "$(date +%T)"; curl -s -o /dev/null -m 2 -w '%{http_
 # sessions on both NEW preferred nodes
 sudo journalctl -u rollup -f | grep -Ei 'leader|BatchProducer'
 ```
-For every run, remove the old instance from the ASG but keep it running as a rollback option. Then stop rollup on it:
+For every run, remove the old instance from the ASG but keep it running until the soak is over. Then stop rollup on it:
 ```bash
 aws --profile $RW autoscaling detach-instances --auto-scaling-group-name $ASG --instance-ids $OLD --should-decrement-desired-capacity
 echo "${N}_DETACHED=$OLD" | tee -a $LOG
@@ -458,20 +446,7 @@ aws --profile $RO ec2 describe-instances --filters Name=tag:Stack,Values=SovRoll
 
 ---
 
-## 6. Rollback
-Configuration rollbacks also go through CDK. **Never edit a launch template, an ASG launch template version or an SSM document by hand.**
-
-| When | Action |
-|---|---|
-| Change set (§3.3) looks wrong | `aws cloudformation delete-change-set --stack-name $STACK --change-set-name i8g-4xlarge-migration`. Nothing was applied. |
-| Deploy (§3.4) fails | CloudFormation rolls the stack back by itself (`UPDATE_ROLLBACK_COMPLETE`). Check with `describe-stack-events`, fix the code, and redo §3.3. |
-| Before §4.6 for a node | Remove the new instance: `set-instance-protection --no-protected-from-scale-in`, then `terminate-instance-in-auto-scaling-group --instance-id $NEW --should-decrement-desired-capacity`. The old node was never touched. To abandon the whole migration, also `git revert` the CDK commit and deploy it through a reviewed change set (§3.3–§3.4). The ASGs then launch c8gd.12xlarge with the RAID profiles again. |
-| After §4.6, before §4.7 | On `$OLD`: `sudo systemctl unmask rollup && sudo systemctl enable --now rollup`. It rejoins as a `DbElected` replica; wait for `ready=200`. Re-attach it: `aws autoscaling attach-instances --auto-scaling-group-name $ASG --instance-ids $OLD` (max size allows 2). Then handle the new instance as in the first row. For the backup, also restore the old cron line: `0 * * * * /home/ubuntu/snapshot-rollup-data.sh` in `crontab -u ubuntu`. |
-| New leader crash-looping after run 2 | In sessions on both new preferred nodes: `sudo systemctl disable --now rollup && sudo systemctl mask rollup`. Then on the old leader: `sudo systemctl unmask rollup && sudo systemctl enable --now rollup`. It's `DbElected` and takes leadership about 1 s after the others stop heartbeating. Diagnose with `journalctl -u rollup`, `journalctl -k \| grep -i oom`, `df -h`. |
-
----
-
-## 7. Time estimate
+## 6. Time estimate
 
 | Step | Duration |
 |---|---|
