@@ -1,7 +1,7 @@
-From 1c653d894ae354d7f45e004553bb6d5d3f8e7e95 Mon Sep 17 00:00:00 2001
+From dabad736f9468d7ac960ee04f7377e2e1703b05b Mon Sep 17 00:00:00 2001
 From: auricom <27022259+auricom@users.noreply.github.com>
 Date: Tue, 17 Nov 2026 16:43:39 +0100
-Subject: [PATCH 2/2] Add RollupNodeInstanceType for single-NVMe rollup nodes
+Subject: [PATCH 1/2] Add RollupNodeInstanceType for single-NVMe rollup nodes
 
 The rollup launch templates hard-coded c8gd.12xlarge and the RAID-0 disk
 profiles. RollupNodeInstanceType (c8gd.12xlarge | i8g.4xlarge) now sets
