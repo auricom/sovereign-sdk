@@ -69,7 +69,7 @@
 **No launch template or SSM document is ever edited by hand.**
 
 - The CDK app is [`Sovereign-Labs/sov-rollup-cdk-starter`](https://github.com/Sovereign-Labs/sov-rollup-cdk-starter). The live stack was deployed from branch `theodore/inplace-config-updates` (open PR #92), not `master`; see §3.
-- CloudTrail shows every deploy is made by the IAM user **`aws-cdk-gentoo`** (last ones 2026-10-29, 2026-10-30, 2026-11-09, 2026-11-18 ×3, CDK `2.220.0`; the 2026-11-18 ones weren't re-checked in CloudTrail, only seen as `User Initiated` stack updates). §3 needs those deploy credentials.
+- Every deploy goes through the CDK bootstrap role **`cdk-hnb659fds-deploy-role-313110633477-us-east-1`**. `aws-cdk-gentoo` is only the role *session name* CDK sets (`aws-cdk-<local OS user>`), not an IAM user: `iam get-user` returns `NoSuchEntity`. CloudTrail (checked 2026-11-19, `CreateChangeSet` 2026-10-09 to 2026-11-18, CDK `2.220.0`) shows the role was assumed from the SSO role `AWSReservedSSO_AdministratorAccess` by the SSO user `theodore`. The role's trust policy allows any principal in the account that has `sts:AssumeRole` on it, so §3 needs an `AdministratorAccess` SSO login (or any principal allowed to assume that role).
 - The change is **parameter-driven** (`RollupNodeInstanceType`, `AuroraEngineVersion` in `deployments/relay/devnet/parameters.json`). The defaults keep every other deployment (`relay/mainnet`, test accounts) resolving to exactly what it runs today. `AuroraEngineVersion` is already on the deploy branch; `RollupNodeInstanceType` comes with the migration patches.
 - The stack's own node-level config-drift check (`SovRollupCdkStarterStack-runtime-config-drift` alarm) **will fire** between the deploy and the last swap. The old nodes run a configuration that no longer matches the stack. It clears once the old nodes are gone.
 
@@ -258,14 +258,16 @@ npm ci && npx tsc --noEmit -p . && npm test                             # 108 pa
 Open the PR **against `theodore/inplace-config-updates`** and get it reviewed. Deploy from this branch, and merge it only after the deploy succeeds.
 
 ### 3.2 Preview the change set (nothing is applied)
-With the deploy credentials (`aws-cdk-gentoo` in CloudTrail). `npm run deploy` forwards extra flags to `cdk deploy`:
+With a profile that can assume the CDK deploy role (an `AdministratorAccess` SSO login, §0.5). `npm run deploy` forwards extra flags to `cdk deploy`:
 ```bash
 npm run validate relay devnet
 npm run deploy relay devnet -- --no-execute --change-set-name i8g-4xlarge-migration
 aws cloudformation describe-change-set --stack-name $STACK --change-set-name i8g-4xlarge-migration \
   --query 'Changes[].ResourceChange.{action:Action,id:LogicalResourceId,type:ResourceType,replacement:Replacement,scope:join(`,`,Scope)}' --output table
 ```
-Expected rows, all `Modify` with `Replacement = False`:
+Expected rows, all `Modify`, never `True`. Launch templates show `Replacement = False`. ASGs and SSM documents show `Conditional` (CloudFormation's generic flag), and only because `LaunchTemplate` (via `LatestVersionNumber`) or `Content` changed. Check with `describe-change-set` that no ASG row lists `MinSize`, `MaxSize` or `DesiredCapacity`. `CDKMetadata` also shows up and is harmless.
+
+**Checked on 2026-11-19:** the change set had 12 `Modify` rows and nothing else: 4 launch templates (3 rollup nodes and the proxy, `LaunchTemplateData`), 4 ASGs (`LaunchTemplate` only), 3 SSM documents (`Content`) and `CDKMetadata`. The stack was still `UPDATE_COMPLETE` 2026-11-18T19:41:03Z.
 
 | Resource | Why |
 |---|---|
