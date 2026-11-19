@@ -1,4 +1,4 @@
-From 9f78fad215b1a4401ebbb288f37599479fce1b1d Mon Sep 17 00:00:00 2001
+From bb1011a7a7b490ff5ae642afab15210456326123 Mon Sep 17 00:00:00 2001
 From: auricom <27022259+auricom@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 09:11:56 +0100
 Subject: [PATCH 2/2] Move relay devnet rollup nodes to i8g.4xlarge
@@ -14,13 +14,13 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 2 insertions(+), 1 deletion(-)
 
 diff --git a/deployments/relay/devnet/parameters.json b/deployments/relay/devnet/parameters.json
-index 1c01603..02a19dd 100644
+index 5d81e1c..8ecd43e 100644
 --- a/deployments/relay/devnet/parameters.json
 +++ b/deployments/relay/devnet/parameters.json
 @@ -29,7 +29,8 @@
          "DomainName": "relay-devnet.sovereign-labs.xyz",
          "UnlimitedDomainNames": "relay-devnet-integrations.sovereign-labs.xyz",
-         "AnsibleBranch": "cdk-deployment-october-2026",
+         "AnsibleBranch": "cdk-deployment-november-2026",
 -        "AuroraEngineVersion": "17.9"
 +        "AuroraEngineVersion": "17.9",
 +        "RollupNodeInstanceType": "i8g.4xlarge"

@@ -1,6 +1,7 @@
 # Runbook: migrate the relay-devnet sequencers (`SovRollupCdkStarterStack`) from c8gd.12xlarge to i8g.4xlarge with no downtime
 
-> **Checked on 2026-11-17** against AWS account `313110633477` / `us-east-1` with the read-only profile `ReadOnlyAccess-313110633477`. Nothing has been changed in the account. The CDK branch was updated on 2026-11-18 (§3).
+> **Checked on 2026-11-17 and re-checked on 2026-11-19** against AWS account `313110633477` / `us-east-1` with the read-only profile `ReadOnlyAccess-313110633477`. Nothing has been changed in the account by this runbook.
+> **Changes since 2026-11-17:** the stack was deployed three times on 2026-11-18 (14:33, 16:41, 19:41 UTC) by someone else, so every launch template and SSM document version, the AMI, the Ansible branch and the rollup commit are new (§0.1, §0.6, §2.1, §2.4). The Aurora drift is gone (§2.6). The CDK branch has moved on, and patch 0002 was rebuilt on top of it (§3.1). **None of these deploys was the migration**: the instances are still `c8gd.12xlarge` and still the ones launched in September (v39).
 > Commands marked **[write]** need a profile with write access and are run by a human. Every other command is read-only.
 > Node access is through **SSM Session Manager**: all nodes are registered and `Online`, running Ubuntu 24.04.
 
@@ -12,14 +13,15 @@
 
 | Role | ASG (`desired/min/max`) | Instance | AZ / IP | Launch template | `DISK_PROFILE` today | Sequencer | Election role |
 |---|---|---|---|---|---|---|---|
-| Primary | `SovRollupCdkStarterStack-SovRollupComputePrimaryAsgASG448C4328-fVa4yPZ43E36` (1/1/2) | `i-0baeb42dfeb96cb28` | us-east-1a / 10.0.2.21 | `lt-02a6dc4c5d8cfdc99` (latest v44, instance from v39) | `aws_raid_0` | preferred | `DbElected` |
-| Secondary | `SovRollupCdkStarterStack-SovRollupComputeSecondaryAsgASG8224C640-PKqRyQODK3bD` (1/0/3) | `i-0c9228ec8b0fa847a` | us-east-1b / 10.0.3.143 | `lt-05cf24139fde86881` (v44, instance v39) | `aws_raid_0` | preferred | `DbElected` |
-| Backup | `SovRollupCdkStarterStack-SovRollupComputeBackupNodeAsgASGF12DEAEF-v241AoY1q69R` (1/1/2) | `i-0cc24aae7b0454089` | us-east-1a / 10.0.2.196 | `lt-0e54a3c6b1a4f422e` (v44, instance v39) | `aws_ebs_backup_node_raid_0` | standard (not part of the election) | – |
+| Primary | `SovRollupCdkStarterStack-SovRollupComputePrimaryAsgASG448C4328-fVa4yPZ43E36` (1/1/2) | `i-0baeb42dfeb96cb28` | us-east-1a / 10.0.2.21 | `lt-02a6dc4c5d8cfdc99` (latest v48, instance from v39) | `aws_raid_0` | preferred | `DbElected` |
+| Secondary | `SovRollupCdkStarterStack-SovRollupComputeSecondaryAsgASG8224C640-PKqRyQODK3bD` (1/0/3) | `i-0c9228ec8b0fa847a` | us-east-1b / 10.0.3.143 | `lt-05cf24139fde86881` (v48, instance v39) | `aws_raid_0` | preferred | `DbElected` |
+| Backup | `SovRollupCdkStarterStack-SovRollupComputeBackupNodeAsgASGF12DEAEF-v241AoY1q69R` (1/1/2) | `i-0cc24aae7b0454089` | us-east-1a / 10.0.2.196 | `lt-0e54a3c6b1a4f422e` (v48, instance v39) | `aws_ebs_backup_node_raid_0` | standard (not part of the election) | – |
 | Proxy (not migrated) | `…ProxyAsgASGB1045D50-nWkwreNMu6YC` | `i-035616ee95eaccd94` | us-east-1a / 10.0.0.9 | `lt-02bdfa1164fba9ea6` | – | – | – |
 
 - All three rollup nodes use security group `sg-0e90e09ed3975a293`. Aurora accepts 5432 from that SG, and the proxy reaches 12346/3000 through it. **New instances get the same SG from the launch template, so no SG changes are needed.**
 - Today's `aws_raid_0` layout: NVMe 1 + 2 in RAID0 at `/mnt/rollup` (ext4, 1.9 TB), NVMe 3 at `/mnt/logs`. The backup node also has EBS `/dev/sdf` (`vol-0b7f605d6d0900a4a`, 1800 GiB gp3, 30k IOPS) at `/mnt/snapshots`.
-- Launch template **v44** (the ASGs' current version) differs from **v39** (what the running instances booted from) only in the AMI (`ami-09a93d801db0bafae`, Ubuntu 24.04 arm64) and the Ansible branch (`cdk-deployment-june-2026` → `cdk-deployment-october-2026`).
+- Launch template **v48** (the ASGs' current version, since 2026-11-18 19:42 UTC) differs from **v39** (what the running instances booted from) in the AMI (`ami-0a78311d2d2afa4a3`, Ubuntu 24.04 arm64 `20261118`) and, through the SSM values documents, in the Ansible branch (`cdk-deployment-june-2026` → `cdk-deployment-november-2026`) and the rollup commit (`8df3d0bc…`).
+- The 2026-11-18 deploys created launch template versions 45 to 48 (all `c8gd.12xlarge`; v46 briefly reverted the AMI to `ami-09a93d801db0bafae`, the 2026-10-23 image) and raised the three values documents from version 10 to 14 (`ANSIBLE_BRANCH` `cdk-deployment-october-2026` → `cdk-deployment-november-2026`, `ROLLUP_COMMIT_HASH` `40c49a68…` → `8df3d0bc…`). The proxy ASG was also updated (19:42 to 19:59 UTC).
 
 ### 0.2 Sizing check: GO
 
@@ -43,7 +45,7 @@
 1. **Deploy the CDK change once (§3).**
    - It creates new launch template versions (i8g.4xlarge plus an EBS logs volume) and new SSM values-document versions (single-NVMe `DISK_PROFILE`), and points the three ASGs at them.
    - **Running rollup instances aren't touched:** their ASGs have no rolling-update policy, and nodes only read the SSM documents at boot.
-   - The Aurora drift fix is already on the deploy branch.
+   - The Aurora drift fix is already deployed (2026-11-18).
 2. **Prepare once (§4.0):**
    - disable the old backup's snapshot cron;
    - pre-warm one restore volume per AZ from the latest snapshot, both in parallel.
@@ -67,7 +69,7 @@
 **No launch template or SSM document is ever edited by hand.**
 
 - The CDK app is [`Sovereign-Labs/sov-rollup-cdk-starter`](https://github.com/Sovereign-Labs/sov-rollup-cdk-starter). The live stack was deployed from branch `theodore/inplace-config-updates` (open PR #92), not `master`; see §3.
-- CloudTrail shows every deploy is made by the IAM user **`aws-cdk-gentoo`** (last ones 2026-10-29, 2026-10-30, 2026-11-09, CDK `2.220.0`). §3 needs those deploy credentials.
+- CloudTrail shows every deploy is made by the IAM user **`aws-cdk-gentoo`** (last ones 2026-10-29, 2026-10-30, 2026-11-09, 2026-11-18 ×3, CDK `2.220.0`; the 2026-11-18 ones weren't re-checked in CloudTrail, only seen as `User Initiated` stack updates). §3 needs those deploy credentials.
 - The change is **parameter-driven** (`RollupNodeInstanceType`, `AuroraEngineVersion` in `deployments/relay/devnet/parameters.json`). The defaults keep every other deployment (`relay/mainnet`, test accounts) resolving to exactly what it runs today. `AuroraEngineVersion` is already on the deploy branch; `RollupNodeInstanceType` comes with the migration patches.
 - The stack's own node-level config-drift check (`SovRollupCdkStarterStack-runtime-config-drift` alarm) **will fire** between the deploy and the last swap. The old nodes run a configuration that no longer matches the stack. It clears once the old nodes are gone.
 
@@ -77,13 +79,13 @@ The single-NVMe support already exists in the Ansible branch the new instances b
 Boot chain, from launch template user data:
 1. User data writes `/etc/rollup-node.env` (`ROLLUP_NODE_TYPE=primary|secondary|backup`) and runs `/home/ubuntu/render_config.sh`.
 2. The render script fetches the SSM document `…-runtime-config-values-<type>` and writes `/home/ubuntu/runtime_vars.yaml`. That file includes `disk_profile`, `rollup_node_role`, `rollup_sequencer_kind`, the Aurora URL, and `rollup_node_id` (= instance ID).
-3. User data runs `bootstrap.sh` and `ansible-pull` of `rollup-starter-ansible@cdk-deployment-october-2026` (`local.yml`, roles `common` + `rollup`).
+3. User data runs `bootstrap.sh` and `ansible-pull` of `rollup-starter-ansible@cdk-deployment-november-2026` (`local.yml`, roles `common` + `rollup`).
 4. Ansible `common` role:
    - `custom_vars.yaml` loads the profile.
    - `disk_discovery.yaml` lists instance-store disks by model (`Amazon EC2 NVMe Instance Storage`). It resolves the EBS volumes by **EC2 attachment name** (`/dev/sdg`, `/dev/sdf`) using `discover_ebs_disk.py`, which reads the NVMe controller metadata, so Linux device order doesn't matter.
    - `disks.yaml` formats and mounts the disks.
 5. Ansible `rollup` role:
-   - builds the rollup at commit `40c49a68…` and installs `rollup.service`;
+   - builds the rollup at commit `8df3d0bc…` and installs `rollup.service`;
    - installs `restore-from-snapshot.sh`;
    - on the backup only, installs the hourly snapshot cron;
    - starts rollup.
@@ -114,8 +116,8 @@ export AWS_REGION=us-east-1
 export RO=ReadOnlyAccess-313110633477           # read-only checks
 export RW=<profile with write access to 313110633477>   # [write] steps
 export DOMAIN=relay-devnet.sovereign-labs.xyz
-export LT_BASE=44                               # latest version of the 3 launch templates before the deploy
-export DOC_BASE=10                              # default version of the 3 values documents before the deploy
+export LT_BASE=48                               # latest version of the 3 launch templates before the deploy
+export DOC_BASE=14                              # default version of the 3 values documents before the deploy
 export STACK=SovRollupCdkStarterStack
 export LOG=~/i8g-migration-relay-devnet.env     # every ID created is appended here
 
@@ -146,9 +148,9 @@ In a new shell: re-export the above, then `source $LOG`. §4.0 adds `SNAP`, `VOL
 aws --profile $RO autoscaling describe-auto-scaling-groups --auto-scaling-group-names $P_ASG $S_ASG $B_ASG \
   --query 'AutoScalingGroups[].{asg:AutoScalingGroupName,desired:DesiredCapacity,max:MaxSize,ltv:LaunchTemplate.Version,inst:Instances[].[InstanceId,LifecycleState,HealthStatus]}' --output json
 aws --profile $RO ec2 describe-launch-templates --launch-template-ids $P_LT $S_LT $B_LT \
-  --query 'LaunchTemplates[].[LaunchTemplateId,LatestVersionNumber]' --output text            # all 44
-for d in $P_DOC $S_DOC $B_DOC; do aws --profile $RO ssm describe-document --name $d --query 'Document.[Name,DefaultVersion]' --output text; done   # all 10
-aws --profile $RO cloudformation describe-stacks --stack-name SovRollupCdkStarterStack --query 'Stacks[0].[StackStatus,LastUpdatedTime]' --output text
+  --query 'LaunchTemplates[].[LaunchTemplateId,LatestVersionNumber]' --output text            # all 48
+for d in $P_DOC $S_DOC $B_DOC; do aws --profile $RO ssm describe-document --name $d --query 'Document.[Name,DefaultVersion]' --output text; done   # all 14
+aws --profile $RO cloudformation describe-stacks --stack-name SovRollupCdkStarterStack --query 'Stacks[0].[StackStatus,LastUpdatedTime]' --output text   # UPDATE_COMPLETE 2026-11-18T19:41:03+00:00
 ```
 If any value differs (someone deployed), update `LT_BASE` / `DOC_BASE` and re-read §0.1.
 
@@ -175,7 +177,9 @@ On each old node:
 ```bash
 grep -E '^(rollup_commit_hash|disk_profile|rollup_node_role|rollup_sequencer_kind|rollup_node_id)' /home/ubuntu/runtime_vars.yaml
 ```
-Every node must show `rollup_commit_hash: "40c49a68fc67c0990a2d8bbe5a472f7527b44885"`, the value new nodes get from SSM. **If an old node runs a different commit, stop.** New nodes would run a different binary from the one that wrote the snapshot.
+Every node must show `rollup_commit_hash: "8df3d0bc67268b1d249feff682edbe34a8c7d230"`, the value new nodes get from SSM. **If an old node runs a different commit, stop.** New nodes would run a different binary from the one that wrote the snapshot.
+
+**Open on 2026-11-19, not checked yet.** Until 2026-11-17 the SSM value was `40c49a68…`, and the 2026-11-18 deploys moved it to `8df3d0bc…` without touching the running instances. If the old nodes still show `40c49a68…`, this check fails. Before going on, ask whoever deployed and either (a) bring the old nodes to `8df3d0bc…` first, or (b) set `ROLLUP_COMMIT_HASH` back to `40c49a68…` through CDK for the migration deploy, and bump it after the migration.
 
 ### 2.5 Snapshots are healthy
 ```bash
@@ -195,9 +199,9 @@ aws --profile $RO cloudformation describe-stack-resource-drifts --stack-name $ST
 ```
 Expect `DETECTION_COMPLETE  IN_SYNC  0`. If anything is already drifted, sort it out with the CDK owner first: either fix it in code or revert it by hand. Otherwise the deploy in §3 will silently overwrite it.
 
-**Result on 2026-11-17: `DRIFTED 1`.** `SovRollupAuroraClusterC528DD46` (`AWS::RDS::DBCluster`) has `/EngineVersion` expected `17.5`, actual `17.9`, after an automatic Aurora minor upgrade.
-- The fix is already pushed to the deploy branch (`AuroraEngineVersion=17.9`, §3). The first devnet deploy from that branch clears it, whether that's a separate deploy or the migration deploy itself.
-- Check the cluster still reports 17.9 before deploying: `aws --profile $RO rds describe-db-clusters --query 'DBClusters[].EngineVersion'`. If it moved again, bump `AuroraEngineVersion` in `parameters.json` first.
+**Result on 2026-11-17: `DRIFTED 1`.** (**Re-run on 2026-11-19: `DETECTION_COMPLETE  IN_SYNC  0`.** The 2026-11-18 deploy applied the fix below, and the cluster still reports 17.9. Keep the rest of this paragraph for reference.) `SovRollupAuroraClusterC528DD46` (`AWS::RDS::DBCluster`) has `/EngineVersion` expected `17.5`, actual `17.9`, after an automatic Aurora minor upgrade.
+- The fix (`AuroraEngineVersion=17.9`, §3) was deployed on 2026-11-18.
+- Check the cluster still reports 17.9 before deploying (17.9 on 2026-11-19): `aws --profile $RO rds describe-db-clusters --query 'DBClusters[].EngineVersion'`. If it moved again, bump `AuroraEngineVersion` in `parameters.json` first.
 - This drift is the only one acceptable here. Anything else must be sorted out first. If the read-only profile can't call `detect-stack-drift`, run these three commands with `$RW`; drift detection doesn't modify anything.
 
 ### 2.7 Freeze
@@ -215,15 +219,15 @@ Tell dev users when the leader swap (a few seconds of write pause) will happen.
 **Repo:** [`Sovereign-Labs/sov-rollup-cdk-starter`](https://github.com/Sovereign-Labs/sov-rollup-cdk-starter). Devnet is deployed with `npm run deploy relay devnet`, configured by `deployments/relay/devnet/{config.json,parameters.json}` (account `313110633477`, stack `SovRollupCdkStarterStack`, `production: true`, so the script asks you to type `yes`).
 
 **Deploy from `theodore/inplace-config-updates` (open PR #92), never from `master`.**
-- That branch is what's deployed: `79ee54c` synthesizes identically to the live stack.
-- It now also carries the **Aurora drift fix**, pushed on 2026-11-18:
+- That branch is what's deployed. The live stack (last update 2026-11-18 19:41 UTC) already has the **Aurora drift fix** (`AuroraEngineVersion=17.9` is a live stack parameter), which came in with:
   - `d0ef2ae`: new `AuroraEngineVersion` parameter, default `17.5`;
-  - `5e6cd19`: devnet sets it to `17.9`.
-- Resolved per deployment, that branch head changes **only** the devnet Aurora cluster's `EngineVersion`. Mainnet and the three test deployments change nothing.
+  - `5e6cd19`: devnet sets it to `17.9`;
+  - `03d9448`: devnet bump with the latest rollup (the `8df3d0bc…` commit).
+- The branch head on 2026-11-19 is **`82b426f`** (2026-11-18 21:37 UTC), with two commits that are **not deployed yet**: `47b4a64` (devnet `AnsibleBranch` → `cdk-deployment-november-2026`, which the live SSM values already have; plus a fix to the proxy's replacement race in `lib/userdata/proxy/cfn-helpers.sh`) and `82b426f` (mainnet only). The next devnet deploy therefore also changes the proxy launch template and ASG (see §3.2).
 - `master` lacks the SSM render-document scheme the nodes rely on.
 
 ### 3.1 Apply the migration patches
-The patches are in this fork, in [`docs/ec2-migration-cdk/`](ec2-migration-cdk/), built on top of `5e6cd19`:
+The patches are in this fork, in [`docs/ec2-migration-cdk/`](ec2-migration-cdk/), built on top of `82b426f` (patch 0002 was rebuilt on 2026-11-19: its context changed when `47b4a64` moved the devnet `AnsibleBranch` to `cdk-deployment-november-2026`; patch 0001 is unchanged):
 
 | Patch | Change |
 |---|---|
@@ -238,7 +242,7 @@ How I checked it:
 
 ```bash
 git clone git@github.com:Sovereign-Labs/sov-rollup-cdk-starter.git && cd sov-rollup-cdk-starter
-git switch theodore/inplace-config-updates && git log -3 --oneline     # 5e6cd19 or newer
+git switch theodore/inplace-config-updates && git log -3 --oneline     # 82b426f or newer; if newer, re-check that both patches still apply
 git switch -c i8g-4xlarge-devnet
 git am /path/to/sovereign-sdk/docs/ec2-migration-cdk/000*.patch
 npm ci && npx tsc --noEmit -p . && npm test                             # 108 passed
@@ -257,11 +261,10 @@ Expected rows, all `Modify` with `Replacement = False`:
 
 | Resource | Why |
 |---|---|
-| `SovRollupComputePrimaryLaunchTemplate…`, `…SecondaryLaunchTemplate…`, `…BackupNodeLaunchTemplate…` | `i8g.4xlarge`, `/dev/sdg`, and the newer Ubuntu arm64 AMI the stack's SSM parameter resolves to today |
+| `SovRollupComputePrimaryLaunchTemplate…`, `…SecondaryLaunchTemplate…`, `…BackupNodeLaunchTemplate…` | `i8g.4xlarge`, `/dev/sdg`, and the Ubuntu arm64 AMI the stack's SSM parameter resolves to on the day (`ami-0a78311d2d2afa4a3` today; a newer one only if Canonical published one since) |
 | `SovRollupComputePrimaryAsg…`, `…SecondaryAsg…`, `…BackupNodeAsg…` | `LaunchTemplate.Version` only. No rolling-update policy, so **no instance is replaced** |
 | `SovRollupComputeRuntimeConfigValuesPrimary…`, `…Secondary…`, `…Backup…` | `DISK_PROFILE`. `UpdateMethod: NewVersion` creates a new version and makes it the default |
-| `SovRollupAuroraClusterC528DD46` | Only if the Aurora commit wasn't deployed yet: `EngineVersion` 17.5 → 17.9, which the cluster already runs, so it's a no-op |
-| `SovRollupComputeProxyLaunchTemplate…` + `SovRollupComputeProxyAsg…` | Only if no deploy since 2026-11-09 has picked up the newer Ubuntu amd64 AMI. The proxy ASG's rolling-update policy replaces the proxy one for one, as every recent deploy did. Run at a quiet time and watch `https://$DOMAIN/sequencer/ready` |
+| `SovRollupComputeProxyLaunchTemplate…` + `SovRollupComputeProxyAsg…` | Expected: `47b4a64` changed the proxy user data (`cfn-helpers.sh`) after the last deploy, and a newer Ubuntu amd64 AMI may also apply. The proxy ASG's rolling-update policy replaces the proxy one for one, as every recent deploy did. Run at a quiet time and watch `https://$DOMAIN/sequencer/ready` |
 
 **Stop and don't execute** if the change set shows anything else: any `Replacement: True`, any `Remove`, Aurora *instances* / EIP / VPC / security group / IAM changes, or `MinSize`/`MaxSize`/`DesiredCapacity`. Drop it with `aws cloudformation delete-change-set --stack-name $STACK --change-set-name i8g-4xlarge-migration`.
 
@@ -289,7 +292,7 @@ for d in $P_DOC $S_DOC $B_DOC; do printf '%s: ' $d
     | grep '^DISK_PROFILE=' | sed -E "s/.*'([^']+)'.*/\1/" | base64 -d; echo
 done
 ```
-Record the new versions: `echo "P_LTV=<n> S_LTV=<n> B_LTV=<n>" | tee -a $LOG`. Repeat the §2.6 drift detection: it must report `IN_SYNC 0`, and the Aurora drift is gone too.
+Record the new versions: `echo "P_LTV=<n> S_LTV=<n> B_LTV=<n>" | tee -a $LOG`. Repeat the §2.6 drift detection: it must report `IN_SYNC 0`.
 
 From now on, any instance launched by these ASGs is an i8g.4xlarge with the single-NVMe layout, including an unplanned replacement.
 
