@@ -163,6 +163,8 @@ curl -s localhost:12346/ledger/slots/latest | jq -c '{number,state_root}'
 ```
 Write down which one is the leader (`LEADER=P` or `LEADER=S`). **The other one is migrated first.**
 
+**Result on 2026-11-19: `LEADER=S`.** Secondary (`i-0c9228ec8b0fa847a`) reports `"BatchProducer"`; primary (`i-0baeb42dfeb96cb28`) reports `"PgSyncReplica"`, `ready=200`, slot 5741618 → 5741619. The primary is migrated first.
+
 ### 2.3 Disks and logs volume size
 On each old node:
 ```bash
@@ -179,7 +181,7 @@ grep -E '^(rollup_commit_hash|disk_profile|rollup_node_role|rollup_sequencer_kin
 ```
 Every node must show `rollup_commit_hash: "8df3d0bc67268b1d249feff682edbe34a8c7d230"`, the value new nodes get from SSM. **If an old node runs a different commit, stop.** New nodes would run a different binary from the one that wrote the snapshot.
 
-**Open on 2026-11-19, not checked yet.** Until 2026-11-17 the SSM value was `40c49a68…`, and the 2026-11-18 deploys moved it to `8df3d0bc…` without touching the running instances. If the old nodes still show `40c49a68…`, this check fails. Before going on, ask whoever deployed and either (a) bring the old nodes to `8df3d0bc…` first, or (b) set `ROLLUP_COMMIT_HASH` back to `40c49a68…` through CDK for the migration deploy, and bump it after the migration.
+**Result on 2026-11-19: pass.** All three old nodes show `rollup_commit_hash: "8df3d0bc67268b1d249feff682edbe34a8c7d230"` (and still `disk_profile` `aws_raid_0` / `aws_ebs_backup_node_raid_0`). Their instances still date from September (v39), so the nodes were updated in place after the 2026-11-18 SSM change, not replaced. The `runtime_vars.yaml` value is what new nodes get, but check the *running* binary too: `systemctl show rollup -p ActiveEnterTimestamp` should be after that update.
 
 ### 2.5 Snapshots are healthy
 ```bash
@@ -188,6 +190,8 @@ aws --profile $RO ec2 describe-snapshots --owner-ids self \
   --query 'reverse(sort_by(Snapshots,&StartTime))[:4].[SnapshotId,StartTime,State,FullSnapshotSizeInBytes]' --output table
 ```
 The latest `completed` snapshot must be < 2 h old. On the backup node: `sudo tail -40 /mnt/logs/rollup-snapshot.log` should show `=== Snapshot complete ===` every hour, with no `ERROR`.
+
+**Result on 2026-11-19 10:19 UTC:** latest completed snapshot 09:13 (1 h 06 min old), 10:13 pending. Only 5 snapshots exist (2026-11-19 10:13 pending, 09:13, 08:13, 2026-11-17 23:13, 2026-11-07 03:13). That is expected, not a gap: `snapshot-rollup-data.sh` keeps one snapshot near ages 0 h, 6 h, 1 d, 1 w and 1 month and deletes the rest.
 
 ### 2.6 Drift baseline: the stack must be in sync before we start
 ```bash
