@@ -183,6 +183,8 @@ Every node must show `rollup_commit_hash: "8df3d0bc67268b1d249feff682edbe34a8c7d
 
 **Result on 2026-11-19: pass.** All three old nodes show `rollup_commit_hash: "8df3d0bc67268b1d249feff682edbe34a8c7d230"` (and still `disk_profile` `aws_raid_0` / `aws_ebs_backup_node_raid_0`). Their instances still date from September (v39), so the nodes were updated in place after the 2026-11-18 SSM change, not replaced. The `runtime_vars.yaml` value is what new nodes get, but check the *running* binary too: `systemctl show rollup -p ActiveEnterTimestamp` should be after that update.
 
+**Running binary, checked on 2026-11-19:** `ActiveEnterTimestamp` is 2026-11-18 18:29:34 UTC on the primary and 18:29:37 UTC on the secondary, both after SSM v13 (16:42 UTC, `8df3d0bc…`). On the backup it is 2026-11-19 10:13:50 UTC, which is just the hourly snapshot restart, so it doesn't date the build; its `runtime_vars.yaml` already shows `8df3d0bc…`.
+
 ### 2.5 Snapshots are healthy
 ```bash
 aws --profile $RO ec2 describe-snapshots --owner-ids self \
@@ -207,6 +209,8 @@ Expect `DETECTION_COMPLETE  IN_SYNC  0`. If anything is already drifted, sort it
 - The fix (`AuroraEngineVersion=17.9`, §3) was deployed on 2026-11-18.
 - Check the cluster still reports 17.9 before deploying (17.9 on 2026-11-19): `aws --profile $RO rds describe-db-clusters --query 'DBClusters[].EngineVersion'`. If it moved again, bump `AuroraEngineVersion` in `parameters.json` first.
 - This drift is the only one acceptable here. Anything else must be sorted out first. If the read-only profile can't call `detect-stack-drift`, run these three commands with `$RW`; drift detection doesn't modify anything.
+
+**Go/no-go on 2026-11-19: GO for §3.** 2.1 baselines updated (v48 / v14), 2.2 `LEADER=S`, 2.3 64 GiB logs volume is enough, 2.4 and 2.5 pass, 2.6 `IN_SYNC 0`. Before deploying, re-check that the stack's `LastUpdatedTime` is still `2026-11-18T19:41:03+00:00`, and re-run 2.5 if the pending 10:13 snapshot hasn't completed by about 11:13 UTC.
 
 ### 2.7 Freeze
 Until §5 is done, don't do any of the following:
