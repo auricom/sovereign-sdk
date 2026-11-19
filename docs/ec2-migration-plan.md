@@ -137,7 +137,7 @@ export B_OLD=i-0cc24aae7b0454089
 export B_DOC=SovRollupCdkStarterStack-runtime-config-values-backup
 export SNAP_VOL=vol-0b7f605d6d0900a4a           # old backup node's /dev/sdf: its snapshots seed the restore volumes
 ```
-In a new shell: re-export the above, then `source $LOG`. §4.0 adds `SNAP`, `VOL_1A` and `VOL_1B` to it; §3.4 adds the `*_LTV` versions, and §4 the `*_NEW` IDs.
+In a new shell: re-export the above, then `source $LOG` (§4 defines `setrun`, which sets the per-run variables). §4.0 adds `SNAP`, `VOL_1A` and `VOL_1B` to it; §3.4 adds the `*_LTV` versions, and §4 the `*_NEW` IDs.
 
 ---
 
@@ -366,6 +366,27 @@ Run §4.1–§4.7 three times, finishing each node before starting the next:
 | 1 | the **non-leader** from §2.2 | `N=S ASG=$S_ASG LTV=$S_LTV OLD=$S_OLD` (or the `P_` set if the secondary leads) | `$VOL_1B` for the secondary, `$VOL_1A` for the primary |
 | 2 | the **leader** | the other `P_` / `S_` set | same rule |
 | 3 | **backup** | `N=B ASG=$B_ASG LTV=$B_LTV OLD=$B_OLD` | `$VOL_1A` |
+
+#### Setting the variables for each run
+`$LOG` already has everything the runs need: `P_LTV` / `S_LTV` / `B_LTV` from §3.4, and `SNAP`, `VOL_1A`, `VOL_1B` from §4.0 c. In every new shell, re-export the §1 block, `source $LOG`, define `setrun` once, then call it with the node for the run:
+```bash
+setrun() { case $1 in
+  P) N=P ASG=$P_ASG LTV=$P_LTV OLD=$P_OLD VOL=$VOL_1A NEW=${P_NEW:-} ;;
+  S) N=S ASG=$S_ASG LTV=$S_LTV OLD=$S_OLD VOL=$VOL_1B NEW=${S_NEW:-} ;;
+  B) N=B ASG=$B_ASG LTV=$B_LTV OLD=$B_OLD VOL=$VOL_1A NEW=${B_NEW:-} ;;
+esac; export N ASG LTV OLD VOL NEW; echo "N=$N ASG=$ASG LTV=$LTV OLD=$OLD VOL=$VOL NEW=$NEW"; }
+```
+`VOL` is the restore volume for §4.4: the AZ-1a volume for the primary and the backup, the AZ-1b volume for the secondary. `NEW` comes from `$LOG` once §4.2 has recorded it (`P_NEW`, `S_NEW`, `B_NEW`); it is empty before that and after a fresh shell until `source $LOG`. If it's empty, set it by hand.
+
+| Run | Node | Call | Notes |
+|---|---|---|---|
+| 1 | the non-leader | `setrun P` if `LEADER=S`, `setrun S` if `LEADER=P` | no write pause |
+| 2 | the leader | `setrun S` if `LEADER=S`, `setrun P` if `LEADER=P` | §4.6 is the leader failover: tell dev users before it |
+| 3 | backup | `setrun B` | disable the new node's snapshot cron in §4.3 |
+
+Check the variables with the echo line before every write command. Run 3 reuses `$VOL_1A`, so the volume must be `available` again after the primary's restore.
+
+Devnet, 2026-11-19: `LEADER=S`, so run 1 was `setrun P` (`$VOL_1A`), run 2 `setrun S` (`$VOL_1B`), run 3 `setrun B` (`$VOL_1A`).
 
 ### 4.1 Confirm the ASG launches the new template
 ```bash
