@@ -1,0 +1,32 @@
+From f8fb636a6e44bdd2440d87a13c3e641320af62d7 Mon Sep 17 00:00:00 2001
+From: auricom <27022259+auricom@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 09:03:41 +0100
+Subject: [PATCH] Move relay mainnet rollup nodes to i8g.4xlarge
+
+Switch the mainnet primary, secondary and backup launch templates to
+i8g.4xlarge with the single-NVMe disk profiles and a /dev/sdg logs
+volume, as done for devnet in #93. Running nodes are not touched; each
+node is then replaced one by one following the mainnet migration runbook.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ deployments/relay/mainnet/parameters.json | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/deployments/relay/mainnet/parameters.json b/deployments/relay/mainnet/parameters.json
+index eecc984..3daa95c 100644
+--- a/deployments/relay/mainnet/parameters.json
++++ b/deployments/relay/mainnet/parameters.json
+@@ -36,7 +36,8 @@
+         "DomainName": "rpc.chain.relay.link",
+         "UnlimitedDomainNames": "relay-integrations.sovereign-labs.xyz",
+         "NodeRole": "DbElected",
+-        "AnsibleBranch": "cdk-deployment-november-2026"
++        "AnsibleBranch": "cdk-deployment-november-2026",
++        "RollupNodeInstanceType": "i8g.4xlarge"
+     },
+     "secrets": {
+         "CelestiaGrpcAuthToken": {
+-- 
+2.56.1
+
