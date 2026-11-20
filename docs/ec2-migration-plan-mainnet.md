@@ -273,7 +273,7 @@ Same repo and branch as devnet: `Sovereign-Labs/sov-rollup-cdk-starter`, **`theo
 
 ```bash
 git clone git@github.com:Sovereign-Labs/sov-rollup-cdk-starter.git && cd sov-rollup-cdk-starter
-git switch theodore/inplace-config-updates && git log -3 --oneline     # bae2097 or newer
+git switch theodore/inplace-config-updates && git log -3 --oneline     # a9b2642 or newer (same tree as bae2097)
 npm ci && npx tsc --noEmit -p . && npm test                             # 108 passed
 export AWS_PROFILE=$RW
 npm run validate relay mainnet
@@ -302,14 +302,18 @@ aws cloudformation wait stack-update-complete --stack-name $STACK
 - Then re-run §2.7 a) and c): no parameter differences, `IN_SYNC 0`.
 - If the SSM documents changed (a new rollup commit), the **running** nodes don't pick it up on their own. Their in-place update (`render_config.sh` + `run_ansible.sh`) is a separate operation, and §2.5 must pass again before §3.2.
 
-### 3.2 Apply the migration patch
-The patch is in this fork: [`docs/ec2-migration-cdk/mainnet/0001-Move-relay-mainnet-rollup-nodes-to-i8g.4xlarge.patch`](ec2-migration-cdk/mainnet/). It adds `"RollupNodeInstanceType": "i8g.4xlarge"` to `deployments/relay/mainnet/parameters.json` and is built on `bae2097`.
+### 3.2 Switch to the migration branch
+The change is pushed as branch **`i8g-4xlarge-mainnet`** (`1e073d7`, on top of `a9b2642`). Its only diff against the deploy branch adds `"RollupNodeInstanceType": "i8g.4xlarge"` to `deployments/relay/mainnet/parameters.json`. The same change is also kept as a patch in this fork: [`docs/ec2-migration-cdk/mainnet/`](ec2-migration-cdk/mainnet/).
 ```bash
-git switch -c i8g-4xlarge-mainnet
-git am /path/to/sovereign-sdk/docs/ec2-migration-cdk/mainnet/0001-Move-relay-mainnet-rollup-nodes-to-i8g.4xlarge.patch
+git fetch origin && git switch i8g-4xlarge-mainnet
+git diff origin/theodore/inplace-config-updates --stat                  # only deployments/relay/mainnet/parameters.json, 1 line added
 npm test                                                                # 108 passed
 ```
-Open the PR against `theodore/inplace-config-updates` and get it reviewed. Deploy from it, and merge after the deploy succeeds.
+If Deploy 0 committed an `AuroraEngineVersion` change to the deploy branch, rebase first: `git rebase origin/theodore/inplace-config-updates`.
+
+Open the PR from `i8g-4xlarge-mainnet` against `theodore/inplace-config-updates` and get it reviewed. Deploy from it, and merge after the deploy succeeds.
+
+The deploy branch history contains `f8fb636` and its revert `a9b2642`. `f8fb636` was this change, pushed to the deploy branch by mistake on 2026-11-20 and reverted minutes later; the branch's tree is identical to `bae2097`. Don't be surprised to see both commits in the log.
 
 ### 3.3 Preview and deploy
 ```bash

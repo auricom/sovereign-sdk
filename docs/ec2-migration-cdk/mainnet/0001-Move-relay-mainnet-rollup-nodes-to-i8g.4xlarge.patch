@@ -1,4 +1,4 @@
-From f8fb636a6e44bdd2440d87a13c3e641320af62d7 Mon Sep 17 00:00:00 2001
+From 1e073d76d681af00585f2deeae1adf15dafc2e91 Mon Sep 17 00:00:00 2001
 From: auricom <27022259+auricom@users.noreply.github.com>
 Date: Fri, 20 Nov 2026 09:03:41 +0100
 Subject: [PATCH] Move relay mainnet rollup nodes to i8g.4xlarge
