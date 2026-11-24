@@ -253,7 +253,14 @@ aws --profile $RO rds describe-db-clusters --query 'DBClusters[].[DBClusterIdent
 - If the cluster reports a version other than 17.5, set `"AuroraEngineVersion": "<that version>"` in `deployments/relay/mainnet/parameters.json` and include it in Deploy 0 (§3.1).
 - Anything else that's drifted must be understood and resolved first.
 
-**Result:** _fill in a), b), c), and whether Deploy 0 is needed._
+**Result:**
+- a) _fill in._
+- b) _fill in._
+- c) (2026-11-24) `DRIFTED`, 2 resources:
+  - `SovRollupAuroraClusterC528DD46` `/EngineVersion`: expected `17.5`, actual `17.9`. This is the expected auto-upgrade (`AutoMinorVersionUpgrade=True`). `deployments/relay/mainnet/parameters.json` has no `AuroraEngineVersion` on `theodore/inplace-config-updates` or `i8g-4xlarge-mainnet`, so the template would fall back to the default `17.5`. **Deploy 0 is needed** with `"AuroraEngineVersion": "17.9"`.
+  - `SovRollupComputeSecurityGroup9931E478` (`sg-0fd8abddc1abd7427`, shared by the primary, secondary and backup nodes): there is an extra out-of-band ingress rule, `sgr-010f726fe503e0a60`, tcp `12346` from `0.0.0.0/0`, described as "TEMP: allow main instance to connect to backup". It isn't in the CDK repo's history. The nodes have no public IP, so it is open to the VPC, not to the internet.
+    - It doesn't block the migration. The CDK rules on this SG are separate `SecurityGroupIngress` resources, and `i8g-4xlarge-mainnet` only changes `RollupNodeInstanceType`, so CloudFormation won't touch this rule. New instances join the same SG and keep it.
+    - **Leave it as is during the migration.** Before §3, find out who added it and whether anything still uses it (the primary reaching the backup's `12346`). After §5, either put it in CDK (narrowed to the compute SG as source) or remove it.
 
 ### 2.8 Devnet rehearsal done
 - The devnet runbook's definition of done is met.
