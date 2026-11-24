@@ -179,13 +179,30 @@ aws --profile $RO service-quotas get-service-quota --service-code ec2 --quota-co
 **Result:** _fill in the CPU, memory, network, data size and capacity numbers, then GO / NO-GO._
 
 ### 2.3 Which node is the leader
-In a session on each preferred node (`aws --profile $RW ssm start-session --target $P_OLD`, then `$S_OLD`):
+From the laptop, on both preferred nodes at once:
+```bash
+CMD=$(aws --profile $RW ssm send-command --instance-ids $P_OLD $S_OLD --document-name AWS-RunShellScript \
+  --comment "i8g migration: leader check" \
+  --parameters 'commands=["echo role=$(curl -s localhost:12346/sequencer/role)","curl -s -o /dev/null -w \"ready=%{http_code}\\n\" localhost:12346/sequencer/ready","curl -s localhost:12346/ledger/slots/latest | jq -c \"{number,state_root}\""]' \
+  --query Command.CommandId --output text)
+sleep 5
+for i in $P_OLD $S_OLD; do echo "== $i ($( [ $i = $P_OLD ] && echo P || echo S ))"
+  aws --profile $RW ssm get-command-invocation --command-id $CMD --instance-id $i --query '[Status,StandardOutputContent,StandardErrorContent]' --output text; done
+```
+Or, in a session on each preferred node (`aws --profile $RW ssm start-session --target $P_OLD`, then `$S_OLD`):
 ```bash
 curl -s localhost:12346/sequencer/role; echo                        # "BatchProducer" = leader, "PgSyncReplica" = replica
 curl -s -o /dev/null -w 'ready=%{http_code}\n' localhost:12346/sequencer/ready
 curl -s localhost:12346/ledger/slots/latest | jq -c '{number,state_root}'
 ```
-**Result:** `LEADER=` _P or S_. **The other one is migrated first.**
+**Result (2026-11-24): `LEADER=S`.** The primary is migrated first.
+
+| Node | Instance | AZ | Role | Ready | Latest slot |
+|---|---|---|---|---|---|
+| P | `i-0d4e2920a6cdab794` | us-east-1a | `PgSyncReplica` | 200 | 6914339 |
+| S | `i-0d1e92a6ee0de8daa` | us-east-1b | `BatchProducer` (leader) | 200 | 6914339 |
+
+Same slot, same state root (`0x072b8995…a04992d6`). Re-check just before run 1 and run 2: leadership can move at any time, for example after a restart. If it has moved, swap P and S in the §4.0 d) table.
 
 ### 2.4 Logs volume size
 On each old node: `df -h /mnt/logs; sudo du -sh /mnt/logs/* | sort -h | tail`. New nodes get a **64 GiB** `/dev/sdg` (`ROLLUP_LOGS_VOLUME_GIB`).
@@ -418,13 +435,17 @@ esac; v="VOL_${az//-/_}"; VOL=${!v}
 export N ASG LTV OLD VOL NEW; echo "N=$N ASG=$ASG LTV=$LTV OLD=$OLD AZ=$az VOL=$VOL NEW=$NEW"; }
 ```
 
-| Run | Node | Call | Gate after the run |
-|---|---|---|---|
-| 1 | the non-leader | `setrun P` if `LEADER=S`, `setrun S` if `LEADER=P` | **Gate 1** (§4.5) |
-| 2 | the leader | the other one | **Gate 2** (§4.5). §4.6 is the failover, inside the window agreed with Relay |
-| 3 | backup | `setrun B` | none (no client traffic) |
+With `LEADER=S` (§2.3, 2026-11-24):
 
-Check the `setrun` echo line before every write command. Two nodes in the same AZ share one volume, so it must be `available` again before the second restore.
+| Run | Node | Call | Old instance | AZ / restore volume | Gate after the run |
+|---|---|---|---|---|---|
+| 1 | primary (replica) | `setrun P` | `i-0d4e2920a6cdab794` | us-east-1a / `VOL_us_east_1a` | **Gate 1** (§4.5) |
+| 2 | secondary (leader) | `setrun S` | `i-0d1e92a6ee0de8daa` | us-east-1b / `VOL_us_east_1b` | **Gate 2** (§4.5). §4.6 is the failover, inside the window agreed with Relay |
+| 3 | backup | `setrun B` | `i-0bf7f7455a4974ec5` | us-east-1a / `VOL_us_east_1a` | none (no client traffic) |
+
+- Check the `setrun` echo line before every write command.
+- A volume only has to reach 100% initialization (§4.0 c) before §4.4 of the run that uses it. §4.1–4.3 can run while it initializes. Run 1 waits on the us-east-1a volume; the us-east-1b one has until run 2.
+- Runs 1 and 3 share the us-east-1a volume, so it must be `available` again before run 3's restore.
 
 ### 4.1 Confirm the ASG launches the new template
 ```bash
