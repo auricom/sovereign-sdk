@@ -121,13 +121,20 @@ Expect:
 - the stack `UPDATE_COMPLETE`;
 - every node `Online` in SSM.
 
-**Result:** _fill in: ASG names, instance IDs, AZ / IP, launch template IDs and versions (`LT_BASE`), values document version (`DOC_BASE`), stack last update._
+**Result (2026-11-24, `$LOG` started 07:50:41Z):** GO.
 
-| Role | ASG | Instance | AZ / IP | Launch template (latest / instance's) | `DISK_PROFILE` | Sequencer | Election |
-|---|---|---|---|---|---|---|---|
-| Primary | | | | | `aws_raid_0` | preferred | `DbElected` |
-| Secondary | | | | | `aws_raid_0` | preferred | `DbElected` |
-| Backup | | | | | `aws_ebs_backup_node_raid_0` | standard | – |
+| Role | ASG (suffix) | min / desired / max | Instance | AZ / IP | Launch template (latest / instance's) | `DISK_PROFILE` | Sequencer | Election |
+|---|---|---|---|---|---|---|---|---|
+| Primary | `…PrimaryAsgASG448C4328-ry4p2GT3nDb7` | 1 / 1 / 2 | `i-0d4e2920a6cdab794` (launched 2026-04-25) | us-east-1a / 10.0.2.203 | `lt-0f16a45ddcd327131` (32 / 12) | `aws_raid_0` | preferred | `DbElected` |
+| Secondary | `…SecondaryAsgASG8224C640-4FewU60ToBqJ` | 0 / 1 / 3 | `i-0d1e92a6ee0de8daa` (launched 2026-07-01) | us-east-1b / 10.0.3.174 | `lt-0f4504c4dbf62fc3d` (32 / 14) | `aws_raid_0` | preferred | `DbElected` |
+| Backup | `…BackupNodeAsgASGF12DEAEF-uigjpnxpAmz1` | 1 / 1 / 2 | `i-0bf7f7455a4974ec5` (launched 2026-04-24) | us-east-1a / 10.0.2.115 | `lt-02788dd06952e62f1` (32 / 12) | `aws_ebs_backup_node_raid_0` | standard | – |
+
+- All three rollup instances are `c8gd.12xlarge`, `InService` / `Healthy`. No ASG has suspended processes.
+- Every ASG points at launch template version `32` (`LT_BASE=32`). The running instances were launched from older versions (12, 12, 14), because later deploys changed the template without replacing the instances. This is expected. It also means that a scale-out before §3 would already launch v32, not the v12/v14 config.
+- Values documents `primary` / `secondary` / `backup`: default = latest = `17` (`DOC_BASE=17`).
+- `SNAP_VOL=vol-0f7c8141e62d4e9c3` (backup `/dev/sdf`).
+- Stack `UPDATE_COMPLETE`, last updated 2026-11-18T19:12:36Z.
+- SSM: all four instances `Online` (Ubuntu 24.04). The fourth one, `i-06a3ed4600e9387e5`, is the proxy: a `t3.small` in us-east-1a (10.0.0.53), in ASG `…ProxyAsgASGB1045D50-SjxW1SMFKgAf`, launched from `lt-07f35f71e7aeef64c` v34. It was launched 2026-11-18T19:12:56Z, 20 s after the last stack update, so that deploy replaced the proxy. Check this in §2.7 for `47b4a64`.
 
 ### 2.2 Sizing go/no-go (mainnet traffic is the deciding factor)
 Devnet passed easily (1-min peak 14% of 48 vCPU). **Mainnet carries Relay's production traffic, so decide from its own numbers.** The target has a third of the vCPUs (16 instead of 48), more RAM (128 vs 96 GiB) and more local disk (3.75 TB vs 1.9 TB RAID0).
